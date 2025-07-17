@@ -20,7 +20,7 @@ from verl import DataProto
 from verl.utils.reward_score import _default_compute_score
 
 
-class NaiveRewardManager:
+class NaivePlusRewardManager:
     """The reward manager."""
 
     def __init__(self, tokenizer, num_examine, compute_score=None, reward_fn_key="data_source") -> None:
@@ -44,6 +44,11 @@ class NaiveRewardManager:
 
         already_print_data_sources = {}
 
+        prompt = []
+        gt = []
+        response = []
+        outcome_reward = []
+
         for i in range(len(data)):
             data_item = data[i]  # DataProtoItem
 
@@ -61,11 +66,8 @@ class NaiveRewardManager:
             # decode
             prompt_str = self.tokenizer.decode(valid_prompt_ids, skip_special_tokens=True)
             response_str = self.tokenizer.decode(valid_response_ids, skip_special_tokens=True)
-
             ground_truth = data_item.non_tensor_batch["reward_model"]["ground_truth"]
-
             data_source = data_item.non_tensor_batch[self.reward_fn_key]
-
             extra_info = data_item.non_tensor_batch.get("extra_info", None)
 
             score = self.compute_score(
@@ -74,6 +76,12 @@ class NaiveRewardManager:
                 ground_truth=ground_truth,
                 extra_info=extra_info,
             )
+
+
+            outcome_reward.append(score)# 每个 sample的最终reward
+            prompt.append(prompt_str)# 每个sample 的prompt
+            gt.append(ground_truth)# 每个sample 的gt
+            response.append(response_str)# 每个sample 的response
 
             if isinstance(score, dict):
                 reward = score["score"]
@@ -103,6 +111,10 @@ class NaiveRewardManager:
             return {
                 "reward_tensor": reward_tensor,
                 "reward_extra_info": reward_extra_info,
+                "prompt": prompt,
+                "ground_truth": gt,
+                "response": response,
+                "outcome_reward": outcome_reward
             }
         else:
             return reward_tensor

@@ -19,8 +19,10 @@ import torch
 from verl import DataProto
 from verl.utils.reward_score import _default_compute_score
 
+import numpy as np
 
-class NaiveRewardManager:
+
+class NaiveMath220KRewardManager:
     """The reward manager."""
 
     def __init__(self, tokenizer, num_examine, compute_score=None, reward_fn_key="data_source") -> None:
@@ -43,6 +45,15 @@ class NaiveRewardManager:
         reward_extra_info = defaultdict(list)
 
         already_print_data_sources = {}
+
+        # 存一个 batch 的信息
+        accuracy_rwd = []
+        tag_rwd = []
+        format_rwd = []
+        prompt = []
+        gt = []
+        response = []
+        outcome_reward = []
 
         for i in range(len(data)):
             data_item = data[i]  # DataProtoItem
@@ -68,12 +79,26 @@ class NaiveRewardManager:
 
             extra_info = data_item.non_tensor_batch.get("extra_info", None)
 
-            score = self.compute_score(
+
+ 
+            
+            score, reward_dict = self.compute_score(
                 data_source=data_source,
                 solution_str=response_str,
                 ground_truth=ground_truth,
                 extra_info=extra_info,
             )
+
+            #### 新增功能 06.05 ####
+            if reward_dict is not None:
+                accuracy_rwd.append(reward_dict["accuracy_reward"])
+                tag_rwd.append(reward_dict["tag_count_reward"])
+                format_rwd.append(reward_dict["format_reward"])
+
+            outcome_reward.append(score)# 每个 sample的最终reward
+            prompt.append(prompt_str)# 每个sample 的prompt
+            gt.append(ground_truth)# 每个sample 的gt
+            response.append(response_str)# 每个sample 的response
 
             if isinstance(score, dict):
                 reward = score["score"]
@@ -98,11 +123,27 @@ class NaiveRewardManager:
                         print(f"[{key}]", value)
                 else:
                     print("[score]", score)
+        if len(accuracy_rwd) > 0:
+            # 打印 reward 详细信息到 wandb
+            rwd_detail = {
+                'reward/accuracy': np.mean(accuracy_rwd),
+                'reward/tag_count': np.mean(tag_rwd),
+                'reward/format_reward': np.mean(format_rwd)
+            }
+        else:
+            rwd_detail = {}
+
+        assert len(prompt) == len(gt) == len(response) == len(outcome_reward)
 
         if return_dict:
             return {
                 "reward_tensor": reward_tensor,
                 "reward_extra_info": reward_extra_info,
+                "reward_detail": rwd_detail,
+                "prompt": prompt,
+                "ground_truth": gt,
+                "response": response,
+                "outcome_reward": outcome_reward
             }
         else:
             return reward_tensor

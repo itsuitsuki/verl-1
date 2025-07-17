@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-Preprocess the GSM8k dataset to parquet format
+Preprocess the LogiQA dataset to parquet format
 """
 
 import argparse
@@ -39,24 +39,30 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    data_source = "openai/gsm8k"
+    data_source = "lucasmccabe/logiqa"
 
-    dataset = datasets.load_dataset(data_source, "main")
+    dataset = datasets.load_dataset(data_source, "default")
 
-    train_dataset = dataset["train"].select([i for i in range(500)])
-    test_dataset = dataset["test"].select([i for i in range(50)])
+    train_dataset = dataset["train"].select([i for i in range(100)])
+    test_dataset = dataset["validation"].select([i for i in range(10)])
 
-    instruction_following = 'Let\'s think step by step and output the final answer after "####".'
+    # train_dataset = dataset["train"]
+    # test_dataset = dataset["validation"]
+
+    instruction_following = 'Let\'s think step by step and output the index number of the correct answer after "####".'
 
     # add a row to each data item that represents a unique id
     def make_map_fn(split):
         def process_fn(example, idx):
-            question_raw = example.pop("question")
+            context = example.pop("context")
+            question_raw = example.pop("query")
+            answer_raw = example.pop("options")# list
+            solution = int(example.pop("correct_option")) +1
 
-            question = question_raw + " " + instruction_following
+            answers = "\n".join([f"Option {i+1}:"+ answer_raw[i] + ".\n" for i in range(len(answer_raw))])
+            question = context + "\n\n" +question_raw + "\n\n" + answers
+            # solution = extract_solution(answer_raw)
 
-            answer_raw = example.pop("answer")
-            solution = extract_solution(answer_raw)
             data = {
                 "data_source": data_source,
                 "prompt": [
@@ -67,11 +73,12 @@ if __name__ == "__main__":
                 ],
                 "ability": "math",
                 "reward_model": {"style": "rule", "ground_truth": solution},
+                "answer": solution,
                 "extra_info": {
                     "split": split,
                     "index": idx,
-                    "answer": answer_raw,
-                    "question": question_raw,
+                    "answer": solution,
+                    "question": context + "\n\n" +question_raw + "\n\n" + answers
                 },
             }
             return data

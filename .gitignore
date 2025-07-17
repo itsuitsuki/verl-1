@@ -123,3 +123,15 @@ ENV/
 logs
 log
 outputs
+
+
+.config/
+.netrc/
+.triton/
+.netrc
+
+eval_output/
+eval/
+
+output_models/
+results/

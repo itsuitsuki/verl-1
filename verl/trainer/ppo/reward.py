@@ -58,20 +58,26 @@ def load_reward_manager(config, tokenizer, num_examine, **reward_kwargs):
     reward_manager_name = config.reward_model.get("reward_manager", "naive")
     if reward_manager_name == "naive":
         from verl.workers.reward_manager import NaiveRewardManager
-
         reward_manager_cls = NaiveRewardManager
+
     elif reward_manager_name == "prime":
         from verl.workers.reward_manager import PrimeRewardManager
-
         reward_manager_cls = PrimeRewardManager
+
     elif reward_manager_name == "batch":
         from verl.workers.reward_manager import BatchRewardManager
-
         reward_manager_cls = BatchRewardManager
+
     elif reward_manager_name == "dapo":
         from verl.workers.reward_manager import DAPORewardManager
-
         reward_manager_cls = DAPORewardManager
+
+    elif reward_manager_name == "naive_plus":
+        from verl.workers.reward_manager import NaivePlusRewardManager
+        reward_manager_cls = NaivePlusRewardManager
+    elif reward_manager_name == "naive_math220k":
+        from verl.workers.reward_manager import NaiveMath220KRewardManager
+        reward_manager_cls = NaiveMath220KRewardManager
     else:
         raise NotImplementedError
 

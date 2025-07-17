@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-Preprocess the GSM8k dataset to parquet format
+Preprocess the AR-LSAT dataset to parquet format
 """
 
 import argparse
@@ -39,24 +39,30 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    data_source = "openai/gsm8k"
+    data_source = "olegbask/AR-LSAT"
 
-    dataset = datasets.load_dataset(data_source, "main")
+    dataset = datasets.load_dataset(data_source, "default")
 
-    train_dataset = dataset["train"].select([i for i in range(500)])
-    test_dataset = dataset["test"].select([i for i in range(50)])
+    # train_dataset = dataset["train"].select([i for i in range(500)])
+    # test_dataset = dataset["validation"].select([i for i in range(50)])
 
-    instruction_following = 'Let\'s think step by step and output the final answer after "####".'
+    train_dataset = dataset["train"]
+    test_dataset = dataset["validation"]
+
+    instruction_following = 'Let\'s think step by step and output the index number of the correct answer after "####".'
 
     # add a row to each data item that represents a unique id
     def make_map_fn(split):
         def process_fn(example, idx):
+            context = example.pop("context")
             question_raw = example.pop("question")
+            answer_raw = example.pop("answers")# list
+            solution = example.pop("label")
 
-            question = question_raw + " " + instruction_following
+            answers = "\n".join([f"{i}:"+ answer_raw[i] + ".\n" for i in range(len(answer_raw))])
+            question = context + "\n\n" +question_raw + "\n\n" + answers + "\n\n" +instruction_following
+            # solution = extract_solution(answer_raw)
 
-            answer_raw = example.pop("answer")
-            solution = extract_solution(answer_raw)
             data = {
                 "data_source": data_source,
                 "prompt": [
@@ -65,13 +71,13 @@ if __name__ == "__main__":
                         "content": question,
                     }
                 ],
-                "ability": "math",
+                "ability": "logic",
                 "reward_model": {"style": "rule", "ground_truth": solution},
                 "extra_info": {
                     "split": split,
                     "index": idx,
-                    "answer": answer_raw,
-                    "question": question_raw,
+                    "answer": solution,
+                    "question": context + "\n\n" +question_raw + "\n\n" + answers
                 },
             }
             return data

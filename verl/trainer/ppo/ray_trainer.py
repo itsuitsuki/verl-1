@@ -630,24 +630,22 @@ class RayPPOTrainer:
             sample_scores.extend(scores)
 
             ############### 新增： wandb reward detail 可视化 ############
-            if result["reward_detail"]:
-                val_reward_dict = {f"val_{k}": v for k, v in result["reward_detail"].items()}
-                self.logger.wandb_log(
-                    data=val_reward_dict,
-                    step=self.global_steps,
-                    commit=False
-                )
-                # 更新 validation table
-                for i in range(len(result["ground_truth"])):
-                    self.validation_table.add_data(
-                        self.global_eps,
-                        self.global_steps,
-                        str(result["prompt"][i]),
-                        str(result["response"][i]),
-                        str(result["ground_truth"][i]),
-                        str(result["outcome_reward"][i])
-                    )
-                pprint(result["reward_detail"])
+            val_reward_dict = None
+            if isinstance(result, dict):
+                if "reward_detail" in result.keys():
+                    val_reward_dict = {f"val_{k}": v for k, v in result["reward_detail"].items()}
+
+                    # 更新 validation table
+                    for i in range(len(result["ground_truth"])):
+                        self.validation_table.add_data(
+                            self.global_eps,
+                            self.global_steps,
+                            str(result["prompt"][i]),
+                            str(result["response"][i]),
+                            str(result["ground_truth"][i]),
+                            str(result["outcome_reward"][i])
+                        )
+                    pprint(result["reward_detail"])
             else:
                 pprint("Detail Reward Info is None !")
             ##################################################################
@@ -690,6 +688,8 @@ class RayPPOTrainer:
                         metric_sec = "val-aux"
                     pfx = f"{metric_sec}/{data_source}/{var_name}/{metric_name}"
                     metric_dict[pfx] = metric_val
+        if val_reward_dict:
+            metric_dict.update(val_reward_dict)
 
         return metric_dict
 
@@ -992,13 +992,11 @@ class RayPPOTrainer:
                             reward_tensor, reward_extra_infos_dict, reward_logging_info = compute_reward(batch, self.reward_fn)#调用2
                             ################# 新增功能：打印 reward 和具体细节 ##########
                             if "reward_detail" in reward_logging_info.keys():
-                                logger.wandb_log(
-                                    data=reward_logging_info["reward_detail"],
-                                    step=self.global_steps,
-                                    commit=False
-                                )
-                                # 在每个 epoch 的 last step 记录一下
-                                # TODO: 
+                                metrics.update(reward_logging_info["reward_detail"])
+                                pprint(reward_logging_info["reward_detail"])
+
+                            if "outcome_reward" in reward_logging_info.keys():
+                                metrics.update({"reward/outcome_reward": np.mean(reward_logging_info["outcome_reward"])})
                                 for i in range(len(reward_logging_info["ground_truth"])):
                                     self.record_table.add_data(
                                         epoch,
@@ -1008,9 +1006,6 @@ class RayPPOTrainer:
                                         str(reward_logging_info["ground_truth"][i]),
                                         str(reward_logging_info["outcome_reward"][i])
                                     )
-                                pprint(reward_logging_info["reward_detail"])
-                            else:
-                                pprint("Detail Reward Info is None !")
                             ##########################################################
 
                     # recompute old_log_probs
@@ -1127,16 +1122,20 @@ class RayPPOTrainer:
                 n_gpus = self.resource_pool_manager.get_n_gpus()
                 metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
 
+
                 # TODO: make a canonical logger that supports various backend
                 logger.log(data=metrics, step=self.global_steps)
 
-                # import pdb; pdb.set_trace()
-                # 新增：Wandb 保存训练记录, 分两个表格（Train & Validation）
-                if self.record_table is not None:
-                    logger.log_table(self.record_table, table_name='Training Record')
-                    logger.log_table(self.validation_table, table_name='Validation Record')
+
                 
                 if is_last_step:
+                    # 补充保存最后的 checkpoint
+                    with _timer("save_checkpoint", timing_raw):
+                        self._save_checkpoint()
+                    # 新增：Wandb 保存训练记录, 分两个表格（Train & Validation）
+                    if self.record_table is not None:
+                        logger.log_table(self.record_table, table_name='Training Record')
+                        logger.log_table(self.validation_table, table_name='Validation Record')
                     pprint(f"Final validation metrics: {last_val_metrics}")
                     progress_bar.update(1)
                     progress_bar.close()

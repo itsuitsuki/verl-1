@@ -7,7 +7,7 @@ from functools import partial, update_wrapper
 from typing import Callable, Dict, Optional
 
 from latex2sympy2_extended import NormalizationConfig
-from math_verify import LatexExtractionConfig, parse, verify
+from math_verify import LatexExtractionConfig, ExprExtractionConfig, StringExtractionConfig, parse, verify
 
 # from .math import strip_string
 
@@ -18,7 +18,7 @@ def compute_score(data_source, solution_str, ground_truth, extra_info) -> float:
     acc_reward = accuracy_reward(solution_str, ground_truth)
     tag_reward = tag_count_reward(solution_str)
     format_reward_value = format_reward(solution_str)
-    reward += (1*acc_reward + 1*tag_reward + 1*format_reward_value)/3
+    reward += (0.1*acc_reward + 0.1*tag_reward + 0.8*format_reward_value)
     # print(f"acc_reward: {acc_reward}, tag_reward: {tag_reward}, format_reward_value: {format_reward_value}, total_reward: {reward}")
     reward_dict = {
         "accuracy_reward": acc_reward,
@@ -45,16 +45,23 @@ def accuracy_reward(solution_str:str, ground_truth:str) -> float:
                         nits=False,
                         malformed_operators=False,
                         basic_latex=True,
-                        equations=True,
+                        # equations=True,
                         boxed="all",
                         units=True,
                     ),
                     # Ensures that boxed is tried first
                     boxed_match_priority=0,
                     try_extract_without_anchor=False,
+                ),
+                ExprExtractionConfig(
+                    try_extract_without_anchor=True,
+                ),
+                StringExtractionConfig(
+                    strings= ("A", "B", "C", "D"),
+                    try_extract_without_anchor=True,
+                    lowercase=True
                 )
-            ],
-            extraction_mode="first_match",
+            ]
         )
         # Compute binary rewards if verifiable, `None` otherwise to skip this example
         # print(f"\033[1;31;36m [Ground_truth]: {ground_truth}  \033[0m")

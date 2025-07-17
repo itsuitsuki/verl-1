@@ -1068,6 +1068,7 @@ class RewardModelWorker(Worker):
         # download the checkpoint from hdfs
         local_path = copy_to_local(config.model.path)
 
+
         if self.config.model.input_tokenizer is None:
             self._do_switch_chat_template = False
         else:
@@ -1208,11 +1209,20 @@ class RewardModelWorker(Worker):
         rm_attention_mask = []
 
         for i in range(data.batch.batch_size[0]):
+            # import pdb;pdb.set_trace()
+            '''
             # extract raw prompt
             if isinstance(data.non_tensor_batch["raw_prompt"][i], list):
                 chat: list = data.non_tensor_batch["raw_prompt"][i]
             else:
                 chat: list = data.non_tensor_batch["raw_prompt"][i].tolist()
+            '''
+            import pdb;pdb.set_trace()
+            # extract raw prompt
+            if isinstance(data.non_tensor_batch["extra_info"]['question'][i], list):
+                chat: list = data.non_tensor_batch["extra_info"]['question_raw'][i]["question"]
+            else:
+                chat: list = data.non_tensor_batch["extra_info"]['question_raw'][i]["question"].tolist()
 
             # extract response
             response_ids = data.batch["responses"][i]
