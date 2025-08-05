@@ -1356,3 +1356,1047 @@ class AsyncActorRolloutRefWorker(ActorRolloutRefWorker):
         if self.vllm_tp_rank == 0 and method != "execute_model":
             print(f"[DP={self.vllm_dp_rank},TP={self.vllm_tp_rank}] execute_method: {method if isinstance(method, str) else 'Callable'}")
         return self.rollout.execute_method(method, *args, **kwargs)
+    
+
+
+
+class ProcessRewardModelWorker(Worker):
+    """
+    Note that we only implement the process reward model that is subclass of AutoModelForTokenClassification.
+    """
+
+    def __init__(self, config):
+        super().__init__()
+        import torch.distributed
+        if not torch.distributed.is_initialized():
+            torch.distributed.init_process_group(backend="nccl")
+        self.config = config
+
+        # build device mesh for Ulysses Sequence Parallel
+        world_size = torch.distributed.get_world_size()
+        from torch.distributed.device_mesh import init_device_mesh
+
+        fsdp_size = self.config.model.fsdp_config.fsdp_size
+        self.device_mesh = create_device_mesh(world_size=world_size, fsdp_size=fsdp_size)
+
+        self.ulysses_device_mesh = None
+        self.ulysses_sequence_parallel_size = self.config.get('ulysses_sequence_parallel_size', 1)
+        dp = world_size // self.ulysses_sequence_parallel_size
+        if self.ulysses_sequence_parallel_size > 1:
+            self.ulysses_device_mesh = init_device_mesh('cuda',
+                                                        mesh_shape=(dp, self.ulysses_sequence_parallel_size),
+                                                        mesh_dim_names=['dp', 'sp'])
+
+        self.ulysses_sharding_manager = FSDPUlyssesShardingManager(self.ulysses_device_mesh)
+
+        self.use_remove_padding = self.config.model.get('use_remove_padding', False)
+        self._is_offload_param = self.config.model.fsdp_config.param_offload
+        self._is_offload_optimizer = self.config.model.fsdp_config.optimizer_offload
+
+        credit_assignment = self.config.get('credit_assignment', 0.1)
+        if credit_assignment in ['gamma-decay', 'strict min-form']:
+            self.disable_approx_min_form_credit_assignment = True
+        else:
+            self.disable_approx_min_form_credit_assignment = False
+            self.temperature = credit_assignment
+
+        # TODO: online training of PRM
+        assert not self.config.training, "Not support yet."
+        # normalize config
+        # self.config.ppo_mini_batch_size //= (torch.distributed.get_world_size() // self.ulysses_sequence_parallel_size)
+
+    def _build_prm_optimizer(self, config):
+        from torch import optim
+        from torch.distributed.fsdp import CPUOffload
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+        from torch.distributed.fsdp import ShardingStrategy
+        from transformers import AutoConfig, AutoModelForTokenClassification
+
+        from verl.utils.model import print_model_size
+
+        trust_remote_code = config.model.get('trust_remote_code', False)
+        local_path = copy_to_local(config.model.path)
+        self.tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
+
+        torch_dtype = torch.bfloat16
+        model_config = AutoConfig.from_pretrained(local_path, trust_remote_code=trust_remote_code)
+        model_config.num_labels = 2
+
+        use_remove_padding = config.model.get('use_remove_padding', False)
+        if use_remove_padding:
+            from verl.models.registry import check_model_support_rmpad
+            check_model_support_rmpad(model_config.model_type)
+
+        if use_remove_padding and self.ulysses_sequence_parallel_size > 1:
+            from verl.models.transformers.monkey_patch import apply_monkey_patch
+            apply_monkey_patch(model_config, verbose=True)
+
+        init_context = get_init_weight_context_manager(use_meta_tensor=not model_config.tie_word_embeddings)
+        
+        with init_context(), warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            setattr(model_config, 'classifier_dropout', 0.)
+            process_reward_module = AutoModelForTokenClassification.from_pretrained(
+                pretrained_model_name_or_path=local_path,
+                torch_dtype=torch_dtype,
+                config=model_config,
+                attn_implementation='flash_attention_2',
+                trust_remote_code=trust_remote_code,
+            )
+
+            # some parameters may not in torch_dtype
+            process_reward_module.to(torch_dtype)
+
+            # if config.model.get('enable_gradient_checkpointing', False):
+            #     process_reward_module.gradient_checkpointing_enable(gradient_checkpointing_kwargs={'use_reentrant': False})
+        
+        if self.rank == 0:
+            print_model_size(process_reward_module)
+
+        fsdp_config = self.config.model.fsdp_config
+        auto_wrap_policy = get_fsdp_wrap_policy(
+            module=process_reward_module, 
+            config=fsdp_config.get('wrap_policy', None),
+        )
+
+        sharding_strategy = get_sharding_strategy(self.device_mesh)
+
+        process_reward_module = FSDP(
+            process_reward_module,
+            param_init_fn=init_fn,
+            use_orig_params=False,
+            auto_wrap_policy=auto_wrap_policy,
+            device_id=torch.cuda.current_device(),
+            sharding_strategy=sharding_strategy,
+            sync_module_states=True,
+            forward_prefetch=False,
+            device_mesh=self.device_mesh,
+            cpu_offload=CPUOffload(offload_params=True),
+        )
+
+        log_gpu_memory_usage('After PRM FSDP', logger=None)
+
+        if self.config.training:
+            prm_optimizer = optim.AdamW(
+                process_reward_module.parameters(),
+                lr=config.optim.lr,
+                betas=config.optim.get('betas', (0.9, 0.999)),
+                weight_decay=config.optim.get('weight_decay', 1e-2),
+            )
+
+            total_steps = config.optim.get('total_training_steps', 0)
+            num_warmup_steps_ratio = config.optim.get('lr_warmup_steps_ratio', 0.)
+            num_warmup_steps = int(num_warmup_steps_ratio * total_steps)
+
+            print(f'Total steps: {total_steps}, num_warmup_steps: {num_warmup_steps}')
+
+            from verl.utils.torch_functional import get_constant_schedule_with_warmup
+            prm_lr_scheduler = get_constant_schedule_with_warmup(
+                optimizer=prm_optimizer,
+                num_warmup_steps=num_warmup_steps,
+            )
+
+            return process_reward_module, prm_optimizer, prm_lr_scheduler
+        return process_reward_module
+
+    def _init_separator(self, config):
+        # split response into steps based on what character
+        split_step_char = config.get('split_step_char', '\n\n')
+        self.split_step_tokens = []
+        # all tokens which end with "\n\n"
+        for i in range(len(self.tokenizer)):
+            if self.tokenizer.decode(i).endswith(split_step_char):
+                self.split_step_tokens.append(i)
+        self.split_step_tokens = torch.LongTensor(
+            self.split_step_tokens, 
+        ).to(device=torch.cuda.current_device())
+
+        # token for reward prediction
+        step_separator = config.get('step_separator', '\n')
+        self.step_separator_token = self.tokenizer.encode(
+            step_separator, 
+            return_tensors='pt',
+            add_special_tokens=False,
+        ).squeeze(0).to(device=torch.cuda.current_device())
+    
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def init_model(self):
+        import_external_libs(self.config.model.get('external_lib', None))
+
+        results = self._build_prm_optimizer(self.config)
+        if self.config.training:
+            self.process_reward_module, self.prm_optimizer, self.prm_lr_scheduler = results
+        else:
+            self.process_reward_module = results
+        
+        self._init_separator(self.config)
+
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.process_reward_module)
+        if self.config.training and self._is_offload_optimizer:
+            offload_fsdp_optimizer(optimizer=self.prm_optimizer)
+
+        if self.config.training:
+            # initialize:
+            # DataParallel: forward, loss, backward, optim.step
+            # CheckpointManager: save, load ckpt
+            raise NotImplementedError
+
+        torch.cuda.empty_cache()
+
+    def _split_steps(self, data):
+        bs, problem_length = data.batch['prompts'].size()
+        action_mask = data.batch['attention_mask'][:, problem_length:]
+        num_actions = action_mask.size(1)
+        solution_tokens = data.batch['responses']
+
+        # find step separator, typically '\n\n'
+        row_ids, column_ids = torch.where(
+            torch.isin(solution_tokens, self.split_step_tokens)
+        )
+        # +1 for the last step with eos instead of step separator
+        max_num_steps = max(
+            [column_ids[row_ids==i].numel() for i in range(bs)]) + 1
+        # end index of each step, shape: (B, max_num_steps), type: long
+        score_ids = torch.full(
+            (bs, max_num_steps), -1, dtype=torch.long, 
+            device=torch.cuda.current_device(),
+        )
+        # whether end of step, shape: (B, max_response_tokens), type: bool
+        reward_mask = torch.zeros_like(solution_tokens, dtype=torch.bool)
+        eos_indices = num_actions - 1 - action_mask.long().fliplr().argmax(1)
+        for j in range(bs):
+            step_separators_per_data = column_ids[row_ids==j]
+            num_intermediate_steps = step_separators_per_data.numel()
+            # intermediate steps
+            score_ids[j, :num_intermediate_steps] = step_separators_per_data
+            reward_mask[j, step_separators_per_data] = True
+            # last step
+            score_ids[j, num_intermediate_steps] = eos_indices[j]
+            reward_mask[j, eos_indices[j]] = True
+        
+        score_mask = score_ids != -1
+        # score_ids, score_mask, reward_mask for data.batch['responses'],
+        # not for data.batch['input_ids']
+        output = dict(
+            score_ids=score_ids,
+            score_mask=score_mask,
+            reward_mask=reward_mask,
+            num_steps=score_mask.float().sum(dim=-1),
+        )
+        return DataProto.from_dict(tensors=output)
+    
+    def _build_inputs_for_prm(self, data):
+        from torch.nn.utils.rnn import pad_sequence
+        from torch.nn import functional as F
+
+        # fetch var
+        problem_ids = data.batch['prompts']
+        attention_mask = data.batch['attention_mask']
+        solution_tokens = data.batch['responses']
+        score_ids = data.batch['score_ids']
+        score_mask = data.batch['score_mask']
+        bs, problem_length = problem_ids.shape
+        total_length = data.batch['input_ids'].size(-1)
+        problem_attn_mask = attention_mask[:, :problem_length]
+        solution_attn_mask = attention_mask[:, problem_length:]
+        device = problem_ids.device
+
+        # build input_ids, attn_mask, and position_ids for PRM
+        # (optional) remove '\n\n' at the end of each step, 
+        # then add '\n' for each step to predict process reward
+        input_ids = []
+        attn_mask = []
+        for i in range(bs):
+            input_ids_per_data = problem_ids[i]
+            attn_mask_per_data = problem_attn_mask[i]
+            # split tokens of each step
+            for idx, j in enumerate(score_ids[i][score_mask[i]]):
+                # j -> '\n\n'
+                if idx == 0:
+                    start_idx = 0
+                else:
+                    start_idx = score_ids[i, idx - 1] + 1
+                # slicer [..., :j] means drop the last '\n\n' of each step
+                step_tokens = solution_tokens[i, start_idx:j]
+                step_attn_mask = solution_attn_mask[i, start_idx:j]
+                # add '\n' after each step to predict process reward
+                input_ids_per_data = torch.cat(
+                    (input_ids_per_data, step_tokens, self.step_separator_token)
+                )
+                attn_mask_per_data = torch.cat(
+                    (attn_mask_per_data, step_attn_mask, torch.ones(
+                        1, device=device, dtype=attn_mask_per_data.dtype
+                    ))
+                )
+            input_ids.append(input_ids_per_data)
+            attn_mask.append(attn_mask_per_data)
+        # gather into batch
+        input_ids = pad_sequence(input_ids, batch_first=True, padding_value=self.tokenizer.pad_token_id)
+        attn_mask = pad_sequence(attn_mask, batch_first=True, padding_value=0)
+        # pad to total_length at dim=1
+        input_ids = F.pad(input_ids, (0, total_length - input_ids.size(-1)), value=self.tokenizer.pad_token_id)
+        attn_mask = F.pad(attn_mask, (0, total_length - attn_mask.size(-1)), value=0)
+        position_ids = compute_position_id_with_mask(attn_mask)
+
+        # for forward of PRM
+        output = dict(
+            input_ids=input_ids,
+            attention_mask=attn_mask,
+            position_ids=position_ids,
+        )
+        # for adv baseline, rather than forward of PRM
+        output = DataProto.from_dict(tensors=output)
+        return output
+
+    def _forward_micro_batch(self, micro_batch):
+        from flash_attn.bert_padding import (
+            index_first_axis,
+            pad_input,
+            rearrange,
+            unpad_input,
+        )
+
+        from verl.utils.ulysses import (
+            gather_outpus_and_unpad,
+            ulysses_pad_and_slice_inputs,
+        )
+        
+        response_length = micro_batch['responses'].size(-1)
+
+        with torch.no_grad(), torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+            input_ids = micro_batch['input_ids']
+            batch, seqlen = input_ids.shape
+            attention_mask = micro_batch['attention_mask']
+            position_ids = micro_batch['position_ids']
+            reward_mask = micro_batch['reward_mask']
+
+            if self.use_remove_padding:
+                input_ids_rmpad, indices, *_ = unpad_input(input_ids.unsqueeze(-1),
+                                                           attention_mask)  # input_ids_rmpad (total_nnz, ...)
+                input_ids_rmpad = input_ids_rmpad.transpose(0, 1)  # (1, total_nnz)
+
+                # unpad the position_ids to align the rotary
+                position_ids_rmpad = index_first_axis(rearrange(position_ids.unsqueeze(-1), "b s ... -> (b s) ..."),
+                                                      indices).transpose(0, 1)
+
+                # pad and slice the inputs if sp > 1
+                if self.ulysses_sequence_parallel_size > 1:
+                    input_ids_rmpad, position_ids_rmpad, pad_size = ulysses_pad_and_slice_inputs(
+                        input_ids_rmpad,
+                        position_ids_rmpad,
+                        sp_size=self.ulysses_sequence_parallel_size,
+                    )
+
+                # only pass input_ids and position_ids to enable flash_attn_varlen
+                output = self.process_reward_module(
+                    input_ids=input_ids_rmpad,
+                    attention_mask=None,
+                    position_ids=position_ids_rmpad,
+                    use_cache=False,
+                )  # prevent model thinks we are generating
+                reward_rmpad = output.logits
+                reward_rmpad = reward_rmpad.squeeze(0)  # (total_nnz)
+
+                # gather output if sp > 1
+                if self.ulysses_sequence_parallel_size > 1:
+                    reward_rmpad = gather_outpus_and_unpad(reward_rmpad,
+                                                           gather_dim=0,
+                                                           unpad_dim=0,
+                                                           padding_size=pad_size)
+
+                # pad it back
+                rm_score = pad_input(reward_rmpad, indices=indices, batch=batch, seqlen=seqlen).squeeze(-1)
+            else:
+                output = self.process_reward_module(input_ids=input_ids,
+                                                    attention_mask=attention_mask,
+                                                    position_ids=position_ids)
+                rm_score = output.logits  # (batch_size, seq_len, 2)
+        
+        rm_score = rm_score[:, -response_length:]
+        rm_score = rm_score.softmax(dim=-1)
+        rm_score = (rm_score[..., 1] - rm_score[..., 0]) * reward_mask  # (batch_size, seq_len)
+        
+        if not self.disable_approx_min_form_credit_assignment:
+            weight = torch.softmax(
+                -rm_score.masked_fill(
+                    ~reward_mask, float('inf')
+                ) / self.temperature,
+                dim=-1,
+            )
+            rm_score *= weight
+        
+        return rm_score
+
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
+    def compute_rm_score(self, data:DataProto):
+        import itertools
+
+        from verl.utils.seqlen_balancing import get_reverse_idx, rearrange_micro_batches
+
+        data = data.to('cuda')
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.process_reward_module)
+
+        data.union(self._split_steps(data))
+        prm_data = self._build_inputs_for_prm(data)
+        prm_data = prm_data.to('cuda')
+        prm_data.union(data.select(batch_keys=['reward_mask', 'responses']))
+        
+        with self.ulysses_sharding_manager:
+            prm_data = self.ulysses_sharding_manager.preprocess_data(data=prm_data)
+
+            self.process_reward_module.eval()
+            batch = prm_data.batch
+
+            use_dynamic_bsz = self.config.use_dynamic_bsz
+            if use_dynamic_bsz:
+                max_token_len = self.config.forward_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
+                micro_batches, indices = rearrange_micro_batches(batch=batch, max_token_len=max_token_len)
+            else:
+                micro_batches = batch.split(self.config.micro_batch_size_per_gpu)
+            
+            output = []
+            for micro_batch in micro_batches:
+                rm_score = self._forward_micro_batch(micro_batch)
+                output.append(rm_score)
+            token_level_scores = torch.cat(output, dim=0)
+            
+            if use_dynamic_bsz:
+                indices = list(itertools.chain.from_iterable(indices))
+                assert len(indices) == token_level_scores.size(0), f"{len(indices)} vs. {token_level_scores.size()}"
+                revert_indices = torch.tensor(get_reverse_idx(indices), dtype=torch.long)
+                token_level_scores = token_level_scores[revert_indices]
+
+            output = DataProto.from_dict(tensors={'rm_scores': token_level_scores})
+            output = self.ulysses_sharding_manager.postprocess_data(data=output)
+
+        # https://pytorch.org/docs/stable/notes/fsdp.html#fsdp-notes
+        # unshard the root FSDP module
+        if self.world_size > 1:
+            self.process_reward_module._handle.reshard(True)
+        
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.process_reward_module)
+
+        output = output.to('cpu')
+        torch.cuda.empty_cache()
+        return output
+
+
+class RemoteLLMJudgeWorker(Worker):
+    """
+    Remote LLM-as-a-Judge Process Reward Worker that uses remote API calls
+    instead of local model inference. This is more efficient and scalable.
+    """
+
+    def __init__(self, config):
+        super().__init__()
+        if not torch.distributed.is_initialized():
+            torch.distributed.init_process_group(backend="nccl")
+        
+        self.config = config
+        
+        # Remote inference configuration
+        self.api_base_url = config.llm_as_judge_api.get('api_base_url', 'http://127.0.0.1:8000')
+        self.model_name = config.llm_as_judge_api.get('model_name', 'judge-model')
+        self.max_judge_output_length = config.llm_as_judge_api.get('max_judge_output_length', 100)
+        self.temperature = config.llm_as_judge_api.get('temperature', 0.6)
+        self.request_timeout = config.llm_as_judge_api.get('request_timeout', 30)
+        self.max_retries = config.llm_as_judge_api.get('max_retries', 3)
+        self.retry_delay = config.llm_as_judge_api.get('retry_delay', 1.0)
+
+        self.top_p = config.llm_as_judge_api.get('top_p', 0.9)
+        self.top_k = config.llm_as_judge_api.get('top_k', 50)
+        self.min_p = config.llm_as_judge_api.get('min_p', 0.01)
+        self.repetition_penalty = config.llm_as_judge_api.get('repetition_penalty', 1.0)
+        self.frequency_penalty = config.llm_as_judge_api.get('frequency_penalty', 0.0)
+        self.length_penalty = config.llm_as_judge_api.get('length_penalty', 1.0)
+        
+        # Judge prompt template
+        self.judge_prompt_template = config.llm_as_judge_api.get('judge_prompt_template', None)
+        if self.judge_prompt_template is None:
+            self.judge_prompt_template = """Please evaluate the quality of the following reasoning step in solving the problem.
+
+[Problem]
+{problem}
+
+[Previous steps]
+{previous_steps}
+
+[Current step being evaluated]
+{current_step}
+
+Please rate this step on a scale from 0 to 1, where:
+- 0: Completely incorrect or harmful to the solution
+- 1: Perfectly correct and helpful for solving the problem
+
+Consider:
+- Mathematical accuracy
+- Logical consistency with previous steps
+- Progress towards the solution
+
+Please provide your evaluation and place your final score in \\boxed{{}} format. For example: \\boxed{{0.87543}}"""
+
+        # Step separation configuration
+        self.split_step_char = config.llm_as_judge_api.get('split_step_char', '\n\n')
+        self.step_separator = config.llm_as_judge_api.get('step_separator', '\n')
+        
+        # Credit assignment configuration
+        self.disable_approx_min_form_credit_assignment = config.get('disable_approx_min_form_credit_assignment', False)
+        self.credit_assignment_temperature = config.get('credit_assignment_temperature', 1.0)
+        
+        # Initialize tokenizer for text processing
+        self._init_tokenizer()
+        
+        # Initialize HTTP session for connection pooling
+        import requests
+        self.session = requests.Session()
+        
+        # Set up request headers
+        self.session.headers.update({
+            'Content-Type': 'application/json',
+            'User-Agent': 'RemoteLLMJudgeWorker/1.0'
+        })
+
+    def _init_tokenizer(self):
+        """Initialize tokenizer for text processing"""
+        from verl.utils import hf_tokenizer
+        from verl.utils.fs import copy_to_local
+        
+        # Use a simple tokenizer for text processing (could be same as main model or a fast tokenizer)
+        tokenizer_path = self.config.llm_as_judge_api.get('tokenizer_path', "Qwen/Qwen2.5-1.5B-Instruct")
+        trust_remote_code = self.config.llm_as_judge_api.get('trust_remote_code', True)
+        
+        if os.path.exists(tokenizer_path):
+            local_path = copy_to_local(tokenizer_path)
+        else:
+            local_path = tokenizer_path  # Assume it's a model name from HF hub
+            
+        self.tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
+        self.eos_token = self.tokenizer.decode(self.tokenizer.eos_token_id, skip_special_tokens=False)
+        
+        # Initialize step separator tokens for splitting
+        self.split_step_tokens = []
+        for i in range(len(self.tokenizer)):
+            if self.tokenizer.decode(i).endswith(self.split_step_char):
+                self.split_step_tokens.append(i)
+        self.split_step_tokens = torch.LongTensor(self.split_step_tokens)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def init_model(self):
+        """Initialize the remote connection (no local model needed)"""
+        # Test connection to remote server
+        self._test_connection()
+        
+        # Initialize separator tokens on GPU if needed
+        if torch.cuda.is_available():
+            self.split_step_tokens = self.split_step_tokens.cuda()
+
+    def _test_connection(self):
+        """Test connection to remote API server"""
+        import requests
+        import time
+        
+        try:
+            health_url = f"{self.api_base_url}/health"
+            response = self.session.get(health_url, timeout=5)
+            
+            if response.status_code == 200:
+                logger.info(f"Successfully connected to remote LLM server at {self.api_base_url}")
+            else:
+                logger.warning(f"Remote server returned status {response.status_code}")
+                
+        except requests.RequestException as e:
+            logger.error(f"Failed to connect to remote LLM server: {e}")
+            raise RuntimeError(f"Cannot connect to remote LLM server at {self.api_base_url}")
+
+    def _split_steps(self, data):
+        """Split responses into reasoning steps (same as original implementation)"""
+        bs, problem_length = data.batch['prompts'].size()
+        action_mask = data.batch['attention_mask'][:, problem_length:]
+        num_actions = action_mask.size(1)
+        solution_tokens = data.batch['responses']
+
+        # Find step separator, typically '\n\n'
+        row_ids, column_ids = torch.where(
+            torch.isin(solution_tokens, self.split_step_tokens)
+        )
+        
+        # +1 for the last step with eos instead of step separator
+        max_num_steps = max([column_ids[row_ids==i].numel() for i in range(bs)]) + 1
+        
+        # End index of each step, shape: (B, max_num_steps), type: long
+        score_ids = torch.full(
+            (bs, max_num_steps), -1, dtype=torch.long, 
+            device=solution_tokens.device,
+        )
+        
+        # Whether end of step, shape: (B, max_response_tokens), type: bool
+        reward_mask = torch.zeros_like(solution_tokens, dtype=torch.bool)
+        eos_indices = num_actions - 1 - action_mask.long().fliplr().argmax(1)
+        
+        for j in range(bs):
+            step_separators_per_data = column_ids[row_ids==j]
+            num_intermediate_steps = step_separators_per_data.numel()
+            # Intermediate steps
+            score_ids[j, :num_intermediate_steps] = step_separators_per_data
+            reward_mask[j, step_separators_per_data] = True
+            # Last step
+            score_ids[j, num_intermediate_steps] = eos_indices[j]
+            reward_mask[j, eos_indices[j]] = True
+        
+        score_mask = score_ids != -1
+        output = dict(
+            score_ids=score_ids,
+            score_mask=score_mask,
+            reward_mask=reward_mask,
+            num_steps=score_mask.float().sum(dim=-1),
+        )
+        return DataProto.from_dict(tensors=output)
+
+    def _extract_score_from_response(self, response_text):
+        """Extract numerical score from LLM judge response (same as original)"""
+        import re
+        
+        # First try to extract from \boxed{} format
+        boxed_pattern = r'\\boxed\{([^}]+)\}'
+        boxed_matches = re.findall(boxed_pattern, response_text)
+        
+        if boxed_matches:
+            try:
+                boxed_content = boxed_matches[-1].strip()
+                score = float(boxed_content)
+                return max(0.0, min(1.0, score))
+            except ValueError:
+                pass
+        
+        # Fallback: Try to extract a decimal number between 0 and 1
+        decimal_pattern = r'\b(0\.\d+|1\.0)\b'
+        decimal_matches = re.findall(decimal_pattern, response_text)
+        
+        if decimal_matches:
+            try:
+                score = float(decimal_matches[-1])
+                return max(0.0, min(1.0, score))
+            except ValueError:
+                pass
+        
+        # # If no decimal found, look for integers 0 or 1
+        # integer_pattern = r'\b(0|1)\b'
+        # integer_matches = re.findall(integer_pattern, response_text)
+        
+        # if integer_matches:
+        #     try:
+        #         score = float(integer_matches[-1])
+        #         return max(0.0, min(1.0, score))
+        #     except ValueError:
+        #         pass
+        
+        # Default score if parsing fails
+        return 0.0
+
+    # 封装成函数
+    def _extract_content_value(self, text):
+        pattern = r"'content':\s*'(.*?)',\s*'role'"
+        match = re.search(pattern, text, re.DOTALL)
+        if match:
+            return match.group(1)
+        return None
+
+    def _remote_llm_judge_step(self, problem_text, previous_steps_text, current_step_text):
+        """Use remote LLM API to judge a single reasoning step"""
+        import requests
+        import time
+
+        problem_text_advance = self._extract_content_value(problem_text)
+        if problem_text_advance is None:
+            problem_text_advance = problem_text
+
+        
+        # Format the prompt
+        prompt = self.judge_prompt_template.format(
+            problem=problem_text,
+            previous_steps=previous_steps_text,
+            current_step=current_step_text
+        )
+        
+        
+        # Prepare API request
+        messages = [{'role': 'user', 'content': prompt}]
+        
+        payload = {
+            "model": self.model_name,
+            "messages": messages,
+            "max_tokens": self.max_judge_output_length,
+            "temperature": self.temperature,
+            "top_p": self.top_p,
+            "min_p": self.min_p,
+            "top_k": self.top_k,
+            "repetition_penalty": self.repetition_penalty,
+            "frequency_penalty": self.frequency_penalty,
+            "length_penalty": self.length_penalty,
+            "stop": ["\\n\\n", self.eos_token],  # Stop at double newline to prevent overly long responses
+            "stream": False,
+            
+        }
+
+        # Retry logic for robust API calls
+        for attempt in range(self.max_retries):
+            try:
+                start_time = time.time()
+                
+                response = self.session.post(
+                    f"{self.api_base_url}/v1/chat/completions",
+                    json=payload,
+                    timeout=self.request_timeout
+                )
+                
+                end_time = time.time()
+
+                
+                if response.status_code == 200:
+                    result = response.json()
+                    response_text = result["choices"][0]["message"]["content"]
+                    
+                    # Extract and return score
+                    score = self._extract_score_from_response(response_text)
+                    print("[LLM-as-a-Judge score]" + f"{score}" )
+                    # print("[LLM-as-a-Judge response]" + f"{response_text}" )
+
+                    if self.rank == 0 and attempt == 0:  # Log only on first successful attempt and rank 0
+                        logger.debug(f"Remote judge response time: {end_time - start_time:.3f}s")
+                    
+                    return score
+                
+                else:
+                    logger.warning(f"API request failed with status {response.status_code}: {response.text}")
+                    
+            except requests.RequestException as e:
+                logger.warning(f"API request attempt {attempt + 1} failed: {e}")
+                
+                if attempt < self.max_retries - 1:
+                    time.sleep(self.retry_delay * (2 ** attempt))  # Exponential backoff
+                    
+        # If all retries failed, return default score
+        logger.error(f"All {self.max_retries} API request attempts failed, returning default score")
+        return 0.5
+
+    def _judge_all_steps(self, data):
+        """Judge all steps for all samples in the batch using remote API calls"""
+        bs = data.batch['prompts'].size(0)
+        solution_tokens = data.batch['responses']
+        score_ids = data.batch['score_ids']
+        score_mask = data.batch['score_mask']
+        reward_mask = data.batch['reward_mask']
+        
+        # Initialize scores tensor
+        step_scores = torch.zeros_like(reward_mask, dtype=torch.float32, device=reward_mask.device)
+        
+        for batch_idx in range(bs):
+            # Extract problem text
+            problem_ids = data.batch['prompts'][batch_idx]
+            problem_mask = data.batch['attention_mask'][batch_idx][:len(problem_ids)]
+            valid_problem_ids = problem_ids[problem_mask.bool()]
+            problem_text = self.tokenizer.decode(valid_problem_ids, skip_special_tokens=True)
+            
+            # Process each step
+            previous_steps_text = ""
+            valid_scores = score_ids[batch_idx][score_mask[batch_idx]]
+            
+            for step_idx, step_end_pos in enumerate(valid_scores):
+                # Extract current step
+                if step_idx == 0:
+                    start_pos = 0
+                else:
+                    start_pos = valid_scores[step_idx - 1] + 1
+                
+                current_step_ids = solution_tokens[batch_idx, start_pos:step_end_pos]
+                current_step_text = self.tokenizer.decode(current_step_ids, skip_special_tokens=True)
+                
+                # Judge the current step using remote API
+                score = self._remote_llm_judge_step(problem_text, previous_steps_text, current_step_text)
+                
+                # Assign score to the step end position
+                step_scores[batch_idx, step_end_pos] = score
+
+                # Update previous steps for next iteration
+                if previous_steps_text:
+                    previous_steps_text += "\n" + current_step_text
+                else:
+                    previous_steps_text = current_step_text
+        
+        return step_scores
+
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
+    def compute_rm_score(self, data: DataProto):
+        """Main method to compute process rewards using remote LLM judge"""
+        data = data.to('cuda')
+        
+        # Split data into steps
+        data.union(self._split_steps(data))
+        
+        # Judge all steps for all samples
+        token_level_scores = self._judge_all_steps(data)
+        
+        # Apply credit assignment if configured
+        if not self.disable_approx_min_form_credit_assignment:
+            reward_mask = data.batch['reward_mask']
+            weight = torch.softmax(
+                -token_level_scores.masked_fill(
+                    ~reward_mask, float('inf')
+                ) / self.credit_assignment_temperature,
+                dim=-1,
+            )
+            token_level_scores *= weight
+
+        output = DataProto.from_dict(tensors={'rm_scores': token_level_scores})
+        output = output.to('cpu')
+        
+        return output
+
+    def close(self):
+        """Clean up resources"""
+        if hasattr(self, 'session'):
+            self.session.close()
+
+""" 
+Warning: The following resource request cannot be scheduled right now: {'CPU': 1.0, 'GPU': 2.0}. This is likely due to all cluster resources being claimed by actors. Consider creating fewer actors or adding more nodes to this Ray cluster.
+需要更多的结点才能调试这个方案！
+"""
+class RayJudgePRMWorker(Worker):
+    """
+    Ray-based LLM-as-a-Judge Process Reward Worker (简化版)
+    使用Ray张量并行进行推理
+    """
+
+    def __init__(self, config):
+        super().__init__()
+        if not torch.distributed.is_initialized():
+            torch.distributed.init_process_group(backend="nccl")
+        
+        self.config = config
+        
+        # 配置
+        self.model_path = config.get('model_path', '/data/home/scyb224/Workspace/LLMs/Qwen2.5-7B-Instruct')
+        self.split_step_char = config.get('split_step_char', '\n\n')
+        self.disable_approx_min_form_credit_assignment = config.get('disable_approx_min_form_credit_assignment', False)
+        self.credit_assignment_temperature = config.get('credit_assignment_temperature', 1.0)
+        
+        # Judge模板
+        self.judge_prompt_template = config.get('judge_prompt_template', 
+            """You are an expert evaluator. Please evaluate the quality of the following reasoning step.
+
+Problem: {problem}
+
+Previous steps:
+{previous_steps}
+
+Current step being evaluated:
+{current_step}
+
+Please rate this step from 0 to 1 and put your score in \\boxed{{}} format."""
+        )
+        
+        # 初始化tokenizer
+        self._init_tokenizer()
+
+    def _init_tokenizer(self):
+        """初始化tokenizer"""
+        from verl.utils import hf_tokenizer
+        from verl.utils.fs import copy_to_local
+        
+        trust_remote_code = self.config.get('trust_remote_code', False)
+        local_path = copy_to_local(self.model_path)
+        self.tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
+        
+        # 分割tokens
+        self.split_step_tokens = []
+        for i in range(len(self.tokenizer)):
+            if self.tokenizer.decode(i).endswith(self.split_step_char):
+                self.split_step_tokens.append(i)
+        self.split_step_tokens = torch.LongTensor(self.split_step_tokens)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def init_model(self):
+        """初始化Ray服务"""
+        import ray
+        
+        if not ray.is_initialized():
+            ray.init()
+        
+        # 导入API
+        import sys
+        import os
+        ray_api_path = os.path.join("/data/home/scyb224/Workspace/PURE/bash_script/RayLLMBacakend")
+        if ray_api_path not in sys.path:
+            sys.path.append(ray_api_path)
+        
+        # 预热服务（通过调用一次来初始化）
+        async def init_service():
+            from ray_internal_vllm_api import ray_generate
+            await ray_generate("Hello")  # 预热
+        
+        import asyncio
+        asyncio.run(init_service())
+        
+        if torch.cuda.is_available():
+            self.split_step_tokens = self.split_step_tokens.cuda()
+
+    def _split_steps(self, data):
+        """分割步骤"""
+        bs, problem_length = data.batch['prompts'].size()
+        action_mask = data.batch['attention_mask'][:, problem_length:]
+        num_actions = action_mask.size(1)
+        solution_tokens = data.batch['responses']
+
+        row_ids, column_ids = torch.where(
+            torch.isin(solution_tokens, self.split_step_tokens)
+        )
+        
+        max_num_steps = max([column_ids[row_ids==i].numel() for i in range(bs)]) + 1
+        
+        score_ids = torch.full(
+            (bs, max_num_steps), -1, dtype=torch.long, 
+            device=solution_tokens.device,
+        )
+        
+        reward_mask = torch.zeros_like(solution_tokens, dtype=torch.bool)
+        eos_indices = num_actions - 1 - action_mask.long().fliplr().argmax(1)
+        
+        for j in range(bs):
+            step_separators_per_data = column_ids[row_ids==j]
+            num_intermediate_steps = step_separators_per_data.numel()
+            score_ids[j, :num_intermediate_steps] = step_separators_per_data
+            reward_mask[j, step_separators_per_data] = True
+            score_ids[j, num_intermediate_steps] = eos_indices[j]
+            reward_mask[j, eos_indices[j]] = True
+        
+        score_mask = score_ids != -1
+        return DataProto.from_dict(tensors=dict(
+            score_ids=score_ids,
+            score_mask=score_mask,
+            reward_mask=reward_mask,
+            num_steps=score_mask.float().sum(dim=-1),
+        ))
+
+    def _extract_score_from_response(self, response_text):
+        """提取分数"""
+        import re
+        
+        # 提取 \boxed{} 格式
+        boxed_pattern = r'\\boxed\{([^}]+)\}'
+        matches = re.findall(boxed_pattern, response_text)
+        
+        if matches:
+            try:
+                score = float(matches[-1].strip())
+                return max(0.0, min(1.0, score))
+            except ValueError:
+                pass
+        
+        # 备用方案
+        # decimal_pattern = r'\b(0\.\d+|1\.0)\b' # 匹配0.0到1.0之间的数字
+        # matches = re.findall(decimal_pattern, response_text)
+        
+        # if matches:
+        #     try:
+        #         score = float(matches[-1])
+        #         return max(0.0, min(1.0, score))
+        #     except ValueError:
+        #         pass
+        
+        return 0.5
+
+    def _judge_all_steps(self, data):
+        """批量判断所有步骤"""
+        bs = data.batch['prompts'].size(0)
+        solution_tokens = data.batch['responses']
+        score_ids = data.batch['score_ids']
+        score_mask = data.batch['score_mask']
+        reward_mask = data.batch['reward_mask']
+        
+        step_scores = torch.zeros_like(reward_mask, dtype=torch.float32, device=reward_mask.device)
+        
+        # 准备批量请求
+        batch_requests = []
+        request_positions = []
+        
+        for batch_idx in range(bs):
+            problem_ids = data.batch['prompts'][batch_idx]
+            problem_mask = data.batch['attention_mask'][batch_idx][:len(problem_ids)]
+            valid_problem_ids = problem_ids[problem_mask.bool()]
+            problem_text = self.tokenizer.decode(valid_problem_ids, skip_special_tokens=True)
+            
+            previous_steps_text = ""
+            valid_scores = score_ids[batch_idx][score_mask[batch_idx]]
+            
+            for step_idx, step_end_pos in enumerate(valid_scores):
+                if step_idx == 0:
+                    start_pos = 0
+                else:
+                    start_pos = valid_scores[step_idx - 1] + 1
+                
+                current_step_ids = solution_tokens[batch_idx, start_pos:step_end_pos]
+                current_step_text = self.tokenizer.decode(current_step_ids, skip_special_tokens=True)
+                
+                prompt = self.judge_prompt_template.format(
+                    problem=problem_text,
+                    previous_steps=previous_steps_text,
+                    current_step=current_step_text
+                )
+                
+                batch_requests.append(prompt)
+                request_positions.append((batch_idx, step_end_pos))
+                
+                if previous_steps_text:
+                    previous_steps_text += "\n" + current_step_text
+                else:
+                    previous_steps_text = current_step_text
+        
+        # 批量推理
+        if batch_requests:
+            try:
+                import asyncio
+                from ray_internal_vllm_api import ray_batch_generate
+                
+                batch_responses = asyncio.run(ray_batch_generate(batch_requests))
+                import pdb;pdb.set_trace()
+                for (batch_idx, step_end_pos), response_text in zip(request_positions, batch_responses):
+                    score = self._extract_score_from_response(response_text)
+                    step_scores[batch_idx, step_end_pos] = score
+                    
+            except Exception as e:
+                logger.error(f"批量判断失败: {e}")
+                for batch_idx, step_end_pos in request_positions:
+                    step_scores[batch_idx, step_end_pos] = 0.5
+        
+        return step_scores
+
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
+    def compute_rm_score(self, data: DataProto):
+        """计算奖励分数"""
+        data = data.to('cuda')
+        
+        # 分割步骤
+        data.union(self._split_steps(data))
+        
+        # 判断所有步骤
+        token_level_scores = self._judge_all_steps(data)
+        
+        # 信用分配
+        if not self.disable_approx_min_form_credit_assignment:
+            reward_mask = data.batch['reward_mask']
+            weight = torch.softmax(
+                -token_level_scores.masked_fill(
+                    ~reward_mask, float('inf')
+                ) / self.credit_assignment_temperature,
+                dim=-1,
+            )
+            token_level_scores *= weight
+
+        output = DataProto.from_dict(tensors={'rm_scores': token_level_scores})
+        output = output.to('cpu')
+        
+        return output
+

@@ -144,7 +144,12 @@ class TaskRunner:
         # - The reward type depends on the tag of the data
         if config.reward_model.enable:
             if config.reward_model.strategy in ["fsdp", "fsdp2"]:
-                from verl.workers.fsdp_workers import RewardModelWorker
+                if config.reward_model.worker_type == "prm":
+                    from verl.workers.fsdp_workers import ProcessRewardModelWorker as RewardModelWorker
+                elif config.reward_model.worker_type == "orm":
+                    from verl.workers.fsdp_workers import RewardModelWorker
+                else:
+                    raise NotImplementedError
             elif config.reward_model.strategy == "megatron":
                 from verl.workers.megatron_workers import RewardModelWorker
             else:
@@ -157,9 +162,50 @@ class TaskRunner:
             role_worker_mapping[Role.RefPolicy] = ray.remote(ActorRolloutRefWorker)
             mapping[Role.RefPolicy] = global_pool_id
 
+        # load the reward manager
+        reward_manager_name = config.reward_model.get("reward_manager", "naive")
+        if reward_manager_name == "naive":
+            from verl.workers.reward_manager import NaiveRewardManager
+            reward_manager_cls = NaiveRewardManager
+
+        elif reward_manager_name == "prime":
+            from verl.workers.reward_manager import PrimeRewardManager
+            reward_manager_cls = PrimeRewardManager
+
+        elif reward_manager_name == "batch":
+            from verl.workers.reward_manager import BatchRewardManager
+            reward_manager_cls = BatchRewardManager
+
+        elif reward_manager_name == "dapo":
+            from verl.workers.reward_manager import DAPORewardManager
+            reward_manager_cls = DAPORewardManager
+
+        elif reward_manager_name == "naive_plus":
+            from verl.workers.reward_manager import NaivePlusRewardManager
+            reward_manager_cls = NaivePlusRewardManager
+
+        elif reward_manager_name == "naive_math220k":
+            from verl.workers.reward_manager import NaiveMath220KRewardManager
+            reward_manager_cls = NaiveMath220KRewardManager
+        elif reward_manager_name == "prm":
+            from verl.workers.reward_manager import ProcessRewardManager
+            reward_manager_cls = ProcessRewardManager
+        else:
+            raise NotImplementedError
+
+        compute_score = get_custom_reward_fn(config)
+        reward_fn = reward_manager_cls(tokenizer=tokenizer, num_examine=0, compute_score=compute_score,reward_fn_key=config.data.reward_fn_key, **config.reward_model.get("reward_kwargs", {}))
+        # reward_fn = load_reward_manager(config, tokenizer, num_examine=0, **config.reward_model.get("reward_kwargs", {}))
         
-        reward_fn = load_reward_manager(config, tokenizer, num_examine=0, **config.reward_model.get("reward_kwargs", {}))
-        val_reward_fn = load_reward_manager(config, tokenizer, num_examine=1)
+        # validation reward function
+        if reward_manager_name == "prm":
+            from verl.workers.reward_manager import NaivePlusRewardManager
+            val_reward_fn = NaivePlusRewardManager(tokenizer=tokenizer, num_examine=1, compute_score=compute_score,reward_fn_key=config.data.reward_fn_key)
+        # val_reward_fn = load_reward_manager(config, tokenizer, num_examine=1)
+        val_reward_fn = reward_manager_cls(tokenizer=tokenizer, num_examine=1, compute_score=compute_score,reward_fn_key=config.data.reward_fn_key, **config.reward_model.get("reward_kwargs", {}))
+
+
+
         resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
 
         from verl.utils.dataset.rl_dataset import collate_fn
