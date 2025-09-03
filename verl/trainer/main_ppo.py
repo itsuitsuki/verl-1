@@ -23,6 +23,8 @@ import ray
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer
 # from verl.trainer.ppo.reward import load_reward_manager
 
+os.environ["RAY_ADDRESS"] = "127.0.0.1:4869"
+
 
 def get_custom_reward_fn(config):
     import importlib.util

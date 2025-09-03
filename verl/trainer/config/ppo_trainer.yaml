@@ -176,7 +176,8 @@ critic:
 reward_model:
   enable: False
   strategy: fsdp
-  worker_type: async_judge
+  worker_type: judge
+  training: false
   model:
     input_tokenizer: ${actor_rollout_ref.model.path}  # set this to null if the chat template is identical
     path: ~/models/FsfairX-LLaMA3-RM-v0.1
@@ -191,18 +192,7 @@ reward_model:
       reshard_after_forward: True # only for fsdp2, [True, False, int between 1 and fsdp_size]
       fsdp_size: -1
   llm_as_judge_api:
-    api_base_url: "https://litellm.mybigai.ac.cn"
-    api_key: "sk-QpaRQWxuaYyNcROMt3qi5g"
-    model_name: "deepseek-v3-250324" # judge-model/deepseek-v3-250324
-    max_judge_output_length: 512
-    temperature: 0.6
-    request_timeout: 30
-    max_retries: 3
-    retry_delay: 1.0
-    length_penalty: 1.0
-    judge_prompt_template: "[Problem]{problem}\n\n[Previous steps]{previous_steps}\n\n[Current step being evaluated]{current_step}\n\nYou are an expert in logical reasoning. Please help me determine whether the given current step is logically consistent and correct with respect to the previous steps.Please analyze the reasoning and write your answer inside \\boxed{{}}."
-    tokenizer_path: ${actor_rollout_ref.model.path}
-    trust_remote_code: false
+    model_name: 'judge-model'
   micro_batch_size: null # will be deprecated, use micro_batch_size_per_gpu
   micro_batch_size_per_gpu: null # set a number
   max_length: null

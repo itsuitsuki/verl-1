@@ -1,16 +1,14 @@
 #!/bin/bash
-#SBATCH -J PRM                # 作业名为 xxx
-#SBATCH -o ./logs/LogiQA.out           # 屏幕上的输出文件重定向到 xxx.out
-#SBATCH --qos=lv0b               # 作业使用的 QoS 为 lv0b
-#SBATCH -N 1                      # 作业申请 1 个节点
-#SBATCH --ntasks-per-node=1       # 单节点启动的进程数为 1
-#SBATCH --cpus-per-task=16        # 单任务使用的 CPU 核心数为 4
-#SBATCH -t 48:00:00                # 任务运行的最长时间为 1 小时
-#SBATCH --gres=gpu:2             # 单个节点使用 1 块 GPU 卡
-#SBATCH --mem=160G                  #--mem=<size[units]>：设定每个节点的内存大小，后缀可以为[K|M|G|T]，默认为MB
+#SBATCH -J PRM
+#SBATCH -o ./logs/LogiQA_GRPO_PRM.out
+#SBATCH --qos=lv0b
+#SBATCH -N 1
+#SBATCH --ntasks-per-node=1
+#SBATCH --cpus-per-task=16
+#SBATCH -t 48:00:00
+#SBATCH --gres=gpu:4
+#SBATCH --mem=320G
 
-# 设置运行环境
-# module add /miniconda     # 添加 anaconda/3-5.0.0.1 模块
 
 HOME=/home/chenzhenbin/Workspaces/verl
 

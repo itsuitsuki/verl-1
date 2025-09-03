@@ -1,17 +1,34 @@
-set -x
+#!/bin/bash
+#SBATCH -J PRM
+#SBATCH -o ./logs/LLM-as-a-Judge-0816.out
+#SBATCH --qos=lv0b
+#SBATCH -N 1
+#SBATCH --ntasks-per-node=1
+#SBATCH --cpus-per-task=16
+#SBATCH -t 48:00:00
+#SBATCH --gres=gpu:2
+#SBATCH --mem=160G
 
+
+
+nohup sh /share/nlp/chenzhenbin/Workspaces/verl/bash_scripts/VllmBackend/start_vllm_fast.sh > /share/nlp/chenzhenbin/Workspaces/verl/bash_scripts/VllmBackend/vllm.log 2>&1 & echo $! > /share/nlp/chenzhenbin/Workspaces/verl/bash_scripts/VllmBackend/run.pid
+echo "VLLM API Start Succeed!"
+
+ray start --head
+echo "Ray start Succeed!"
 
 HOME=/share/nlp/chenzhenbin/Workspaces/verl
-
-MODEL_PATH=/share/nlp/chenzhenbin/Workspaces/LLMs/Qwen2.5-7B-Instruct
-
+cd $HOME
+MODEL_PATH=/share/nlp/chenzhenbin/Workspaces/LLMs/Qwen2.5-1.5B-Instruct
 PRM_PATH=None
+
+conda activate verl
 
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
     data.train_files=$HOME/data/logiqa/train.parquet \
     data.val_files=$HOME/data/logiqa/test.parquet \
-    data.train_batch_size=16 \
+    data.train_batch_size=128 \
     data.max_prompt_length=512 \
     data.max_response_length=2048 \
     data.filter_overlong_prompts=True \
@@ -29,7 +46,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.fsdp_config.param_offload=True \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=True \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=8 \
-    actor_rollout_ref.rollout.tensor_model_parallel_size=4 \
+    actor_rollout_ref.rollout.tensor_model_parallel_size=2 \
     actor_rollout_ref.rollout.name=vllm \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
     actor_rollout_ref.rollout.n=2 \
@@ -39,8 +56,6 @@ python3 -m verl.trainer.main_ppo \
     reward_model.enable=True \
     reward_model.worker_type='async_judge' \
     reward_model.reward_manager='naive_plus' \
-    reward_model.llm_as_judge_api.api_base_url='http://127.0.0.1:8000' \
-    reward_model.llm_as_judge_api.model_name='judge-model' \
     reward_model.model.path=${PRM_PATH} \
     reward_model.micro_batch_size_per_gpu=2 \
     reward_model.model.fsdp_config.optimizer_offload=True \
@@ -48,7 +63,7 @@ python3 -m verl.trainer.main_ppo \
     trainer.logger=['console','wandb'] \
     trainer.project_name='verl' \
     trainer.experiment_name='Qwen2.5-1.5B_GRPO_LogiQA_PRM_Judge' \
-    trainer.n_gpus_per_node=4 \
+    trainer.n_gpus_per_node=2 \
     trainer.nnodes=1 \
     trainer.save_freq=-1 \
     trainer.test_freq=10 \

@@ -999,6 +999,8 @@ class RayPPOTrainer:
                         
                         # PRM: function reward
                         reward_fn_tensor = reward_dict["reward_tensor"]
+                        if not self.use_rm:
+                            reward_tensor = reward_fn_tensor
                         reward_fn_dict = DataProto.from_dict({
                             "verifiable_rewards": reward_fn_tensor.sum(-1),
                             "reward_fn_scores": reward_fn_tensor,
@@ -1010,7 +1012,7 @@ class RayPPOTrainer:
                         #     metrics.update(reward_dict["reward_detail"])
                         #     print(reward_dict["reward_detail"])
                         if "outcome_reward" in reward_dict.keys():
-                            metrics.update({"reward/outcome_reward": np.mean(reward_dict["outcome_reward"])})
+                            metrics.update({"reward/mean_fn_reward": np.mean(reward_dict["outcome_reward"])})
                             for i in range(len(reward_dict["ground_truth"])):
                                 self.record_table.add_data(
                                     epoch,

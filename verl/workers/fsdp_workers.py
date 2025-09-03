@@ -2172,9 +2172,12 @@ class AsyncRemoteLLMJudgeWorker(Worker):
         
         # Remote inference configuration  
         self.api_base_url = config.llm_as_judge_api.get('api_base_url', 'http://127.0.0.1:8000')
-        self.api_key = config.llm_as_judge_api.get("api_key","sk-QpaRQWxuaYyNcROMt3qi5g")
+        self.api_key = config.llm_as_judge_api.get("api_key", None)
         self.model_name = config.llm_as_judge_api.get('model_name', 'judge-model')
-        self.headers = {"Authorization": r"Bearer "+self.api_key}
+        if self.api_key is not None:
+            self.headers = {"Authorization": r"Bearer "+self.api_key}
+        else:
+            self.headers={"Content-Type": "application/json"}
         self.max_judge_output_length = config.llm_as_judge_api.get('max_judge_output_length', 100)
         self.temperature = config.llm_as_judge_api.get('temperature', 0.6)
         self.request_timeout = config.llm_as_judge_api.get('request_timeout', 30)
@@ -2402,16 +2405,16 @@ class AsyncRemoteLLMJudgeWorker(Worker):
             payload = {
                 "model": self.model_name,
                 "messages": messages,
-                #"max_tokens": self.max_judge_output_length,
-                #"temperature": self.temperature,
-                #"top_p": self.top_p,
-                #"min_p": self.min_p,
-                #"top_k": self.top_k,
-                #"repetition_penalty": self.repetition_penalty,
-                #"frequency_penalty": self.frequency_penalty,
-                #"length_penalty": self.length_penalty,
-                #"stop": ["\\n\\n", self.eos_token],
-                #"stream": False,
+                "max_tokens": self.max_judge_output_length,
+                "temperature": self.temperature,
+                "top_p": self.top_p,
+                "min_p": self.min_p,
+                "top_k": self.top_k,
+                "repetition_penalty": self.repetition_penalty,
+                "frequency_penalty": self.frequency_penalty,
+                "length_penalty": self.length_penalty,
+                "stop": ["\\n\\n", self.eos_token],
+                "stream": False,
             }
 
             # Retry logic for robust API calls
@@ -2419,10 +2422,10 @@ class AsyncRemoteLLMJudgeWorker(Worker):
                 try:
                     start_time = time.time()
                     async with session.post(
-                        f"{self.api_base_url}/v1/chat/completions",#如果是自己的API：/v1/chat/completions
+                        f"{self.api_base_url}/v1/chat/completions",
                         json=payload,
-                        headers=self.headers,#如果是自己的API可以不需要
-                        #timeout=aiohttp.ClientTimeout(total=self.request_timeout)
+                        #headers=self.headers,#如果是自己的API可以不需要
+                        timeout=aiohttp.ClientTimeout(total=self.request_timeout)
                     ) as response:
                         
                         end_time = time.time()
