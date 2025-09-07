@@ -1758,9 +1758,11 @@ class ProcessRewardModelWorker(Worker):
                 assert len(indices) == token_level_scores.size(0), f"{len(indices)} vs. {token_level_scores.size()}"
                 revert_indices = torch.tensor(get_reverse_idx(indices), dtype=torch.long)
                 token_level_scores = token_level_scores[revert_indices]
-
-            output = DataProto.from_dict(tensors={"rm_scores": token_level_scores})
             
+            print(data.batch.keys())
+            #output = DataProto.from_dict(tensors={"rm_scores": token_level_scores})
+            output = DataProto.from_dict(tensors={"rm_scores": token_level_scores, "score_ids":data.batch['score_ids'], "score_mask":data.batch['score_mask']})
+
             output = self.ulysses_sharding_manager.postprocess_data(data=output)
 
         # https://pytorch.org/docs/stable/notes/fsdp.html#fsdp-notes

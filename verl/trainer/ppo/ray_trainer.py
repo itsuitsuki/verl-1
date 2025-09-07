@@ -89,6 +89,7 @@ class AdvantageEstimator(str, Enum):
     REINFORCE_PLUS_PLUS_BASELINE = "reinforce_plus_plus_baseline"
     REMAX = "remax"
     RLOO = "rloo"
+    STEP_GRPO = "step_grpo"
 
 
 @dataclass
@@ -249,6 +250,18 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
         )
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
+    elif adv_estimator == AdvantageEstimator.STEP_GRPO:
+        grpo_calculation_mask = data.batch["response_mask"]
+        advantages, returns = core_algos.compute_grpo_prm_advantage(
+            token_level_rewards=data.batch["token_level_rewards"],
+            response_mask=grpo_calculation_mask,
+            index=data.non_tensor_batch["uid"],
+            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+            score_idx=data.batch["score_ids"],
+            reward_mask=data.batch["score_mask"]
+        )
+        data.batch["advantages"] = advantages
+        data.batch["returns"] = returns
     else:
         raise NotImplementedError
     return data
@@ -321,6 +334,7 @@ class RayPPOTrainer:
             AdvantageEstimator.REMAX,
             AdvantageEstimator.RLOO,
             AdvantageEstimator.REINFORCE_PLUS_PLUS_BASELINE,
+            AdvantageEstimator.STEP_GRPO,
         ]:
             self.use_critic = False
         else:
