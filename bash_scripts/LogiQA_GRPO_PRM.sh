@@ -1,10 +1,12 @@
 set -x
+export HYDRA_FULL_ERROR=1
+export CUDA_LAUNCH_BLOCKING=1
 
-HOME=/share/nlp/chenzhenbin/Workspaces/verl
+HOME=/data/home/scyb224/Workspace/verl
 
-MODEL_PATH=/share/nlp/chenzhenbin/Workspaces/LLMs/Qwen2.5-1.5B-Instruct
+MODEL_PATH=/data/home/scyb224/Workspace/LLMs/Qwen2.5-1.5B-Instruct
 
-PRM_PATH=/share/nlp/chenzhenbin/Workspaces/LLMs/PURE-PRM-7B
+PRM_PATH=/data/home/scyb224/Workspace/LLMs/PURE-PRM-7B
 
 
 python3 -m verl.trainer.main_ppo \
@@ -46,10 +48,10 @@ python3 -m verl.trainer.main_ppo \
     trainer.val_before_train=False \
     trainer.logger=['console','wandb'] \
     trainer.project_name='verl' \
-    trainer.experiment_name='Qwen2.5-7B_GRPO_LogiQA_PRM_eps2' \
+    trainer.experiment_name='Qwen2.5-7B_GRPO_LogiQA_PRM_eps1' \
     trainer.n_gpus_per_node=2 \
     trainer.nnodes=1 \
     trainer.save_freq=-1 \
     trainer.test_freq=10 \
-    trainer.total_epochs=2 $@
+    trainer.total_epochs=1 $@
 

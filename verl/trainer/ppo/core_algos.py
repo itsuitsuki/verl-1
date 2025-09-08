@@ -194,11 +194,17 @@ def compute_grpo_prm_advantage(
             shape: (bs, response_length)
     """
     scores = token_level_rewards.sum(dim=-1)
+    print(f"Reward shape:{token_level_rewards.shape}")
+    print("The shape of score_idx:", score_idx.shape)
+    print("The shape of reward_mask:", reward_mask.shape)
+    print("The example of score_idx:", score_idx[0])
+    print("The example of reward_mask:", reward_mask[0])
     import pdb;pdb.set_trace()
 
     id2score = defaultdict(list)
     id2mean = {}
     id2std = {}
+
     import pdb;pdb.set_trace()
     with torch.no_grad():
         bsz = scores.shape[0]

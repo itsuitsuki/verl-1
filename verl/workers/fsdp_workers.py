@@ -1758,10 +1758,15 @@ class ProcessRewardModelWorker(Worker):
                 assert len(indices) == token_level_scores.size(0), f"{len(indices)} vs. {token_level_scores.size()}"
                 revert_indices = torch.tensor(get_reverse_idx(indices), dtype=torch.long)
                 token_level_scores = token_level_scores[revert_indices]
+
             
-            print(data.batch.keys())
-            #output = DataProto.from_dict(tensors={"rm_scores": token_level_scores})
-            output = DataProto.from_dict(tensors={"rm_scores": token_level_scores, "score_ids":data.batch['score_ids'], "score_mask":data.batch['score_mask']})
+            # output = DataProto.from_dict(tensors={"rm_scores": token_level_scores})
+            # 将步骤信息添加到 meta_info 中，方便后面的GRPO
+            step_info = {
+                "score_ids": data.batch['score_ids'].detach().cpu().numpy(),
+                "reward_mask": data.batch['reward_mask'].detach().cpu().numpy(),
+            }
+            output = DataProto.from_dict(tensors={"rm_scores": token_level_scores}, meta_info=step_info)
 
             output = self.ulysses_sharding_manager.postprocess_data(data=output)
 
@@ -1772,10 +1777,11 @@ class ProcessRewardModelWorker(Worker):
 
         if self._is_offload_param:
             offload_fsdp_model_to_cpu(self.process_reward_module)
+        
 
         output = output.to("cpu")
         torch.cuda.empty_cache()
-        return output
+        return output 
 
 
 class RemoteLLMJudgeWorker(Worker):
