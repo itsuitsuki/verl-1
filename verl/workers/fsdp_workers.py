@@ -1583,6 +1583,8 @@ class ProcessRewardModelWorker(Worker):
         score_mask = score_ids != -1
         # score_ids, score_mask, reward_mask for data.batch['responses'],
         # not for data.batch['input_ids']
+        # print("Worker shape score_ids:", score_ids.shape)
+        # print(score_ids[0])
         output = dict(
             score_ids=score_ids,
             score_mask=score_mask,
@@ -1729,6 +1731,38 @@ class ProcessRewardModelWorker(Worker):
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.process_reward_module)
 
+        ################# 在分割步骤之前，先收集完整数据以获取完整的 score_ids #################
+        # if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
+        #     import itertools
+        #     from verl.utils.seqlen_balancing import get_reverse_idx, rearrange_micro_batches
+        #     from verl.protocol import all_gather_data_proto
+        #     # 创建当前进程组
+        #     process_group = torch.distributed.group.WORLD
+            
+        #     # 收集所有GPU上的数据
+        #     complete_data = DataProto(
+        #         batch=data.batch.clone(),
+        #         non_tensor_batch=data.non_tensor_batch.copy(),
+        #         meta_info=data.meta_info.copy()
+        #     )
+        #     all_gather_data_proto(complete_data, process_group)
+            
+        #     # 从完整数据中分割步骤
+        #     step_data = self._split_steps(complete_data)
+        #     complete_score_ids = step_data.batch['score_ids']
+        #     complete_reward_mask = step_data.batch['reward_mask']
+        # else:
+        #     # 单GPU情况
+        #     step_data = self._split_steps(data)
+        #     complete_score_ids = step_data.batch['score_ids']
+        #     complete_reward_mask = step_data.batch['reward_mask']
+        # 将步骤信息添加到 meta_info 中，方便后面的GRPO
+        # step_info = {
+        #     "score_ids": complete_score_ids.detach().cpu().numpy(),
+        #     "reward_mask": complete_reward_mask.detach().cpu().numpy(),
+        # }
+        ################################################################################
+
         data.union(self._split_steps(data))
         prm_data = self._build_inputs_for_prm(data)
         prm_data = prm_data.to("cuda")
@@ -1761,12 +1795,11 @@ class ProcessRewardModelWorker(Worker):
 
             
             # output = DataProto.from_dict(tensors={"rm_scores": token_level_scores})
-            # 将步骤信息添加到 meta_info 中，方便后面的GRPO
-            step_info = {
-                "score_ids": data.batch['score_ids'].detach().cpu().numpy(),
-                "reward_mask": data.batch['reward_mask'].detach().cpu().numpy(),
-            }
-            output = DataProto.from_dict(tensors={"rm_scores": token_level_scores}, meta_info=step_info)
+            output = DataProto.from_dict(tensors={"rm_scores": token_level_scores, 
+                                                  "score_ids": data.batch['score_ids'],
+                                                  "reward_mask": data.batch['reward_mask']},
+                                         #meta_info=step_info
+                                         )
 
             output = self.ulysses_sharding_manager.postprocess_data(data=output)
 

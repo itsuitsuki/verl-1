@@ -1,12 +1,10 @@
 set -x
-export HYDRA_FULL_ERROR=1
-export CUDA_LAUNCH_BLOCKING=1
 
-HOME=/data/home/scyb224/Workspace/verl
+HOME=/share/nlp/chenzhenbin/Workspaces/verl
 
-MODEL_PATH=/data/home/scyb224/Workspace/LLMs/Qwen2.5-1.5B-Instruct
+MODEL_PATH=/share/nlp/chenzhenbin/Workspaces/LLMs/Qwen2.5-1.5B-Instruct
 
-PRM_PATH=/data/home/scyb224/Workspace/LLMs/PURE-PRM-7B
+PRM_PATH=/share/nlp/chenzhenbin/Workspaces/LLMs/PURE-PRM-7B
 
 
 python3 -m verl.trainer.main_ppo \
@@ -19,7 +17,7 @@ python3 -m verl.trainer.main_ppo \
     data.filter_overlong_prompts=True \
     data.truncation='error' \
     actor_rollout_ref.model.path=${MODEL_PATH} \
-    actor_rollout_ref.actor.optim.lr=1e-7 \
+    actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.actor.ppo_mini_batch_size=8 \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=10 \
@@ -48,10 +46,10 @@ python3 -m verl.trainer.main_ppo \
     trainer.val_before_train=False \
     trainer.logger=['console','wandb'] \
     trainer.project_name='verl' \
-    trainer.experiment_name='Qwen2.5-7B_GRPO_LogiQA_PRM_eps1' \
+    trainer.experiment_name='Qwen2.5-1.5B_GRPO_LogiQA_PRM_eps1' \
     trainer.n_gpus_per_node=2 \
     trainer.nnodes=1 \
     trainer.save_freq=-1 \
     trainer.test_freq=10 \
-    trainer.total_epochs=1 $@
+    trainer.total_epochs=3 $@
 

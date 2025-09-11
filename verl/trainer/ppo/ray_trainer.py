@@ -257,8 +257,8 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
             response_mask=grpo_calculation_mask,
             index=data.non_tensor_batch["uid"],
             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
-            score_idx=data.meta_info["score_ids"],
-            reward_mask=data.meta_info["reward_mask"]
+            score_idx=data.batch["score_ids"],
+            reward_mask=data.batch["reward_mask"]
         )
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
@@ -1004,8 +1004,8 @@ class RayPPOTrainer:
                             batch = batch.union(reward_tensor)
 
                             end = time.perf_counter()
-                            print(f"######## Compute PRM cost {end - start} seconds, per sample cost {(end-start)/len(batch)}, {len(batch)} samples #########")
-
+                            print(f"[Info] Compute PRM cost {end - start} seconds, per sample cost {(end-start)/len(batch)}, {len(batch)} samples")
+                        
                         # if self.config.reward_model.launch_reward_fn_async:
                         #     future_reward = compute_reward_async.remote(batch, self.config, self.tokenizer)
                         # else:

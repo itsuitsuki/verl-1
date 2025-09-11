@@ -694,7 +694,33 @@ class DataProto:
         batch_lst = []
         for batch in data:
             batch_lst.append(batch.batch)
-        new_batch = torch.cat(batch_lst, dim=0) if batch_lst[0] is not None else None
+
+        ################# 修改前 #################
+        # new_batch = torch.cat(batch_lst, dim=0) if batch_lst[0] is not None else None
+        ################# 修改后 #################
+        if batch_lst[0] is not None:
+        # 特殊处理 score_ids 的填充
+            if 'score_ids' in batch_lst[0]:
+                # 找到 score_ids 的最大长度
+                max_score_len = max(batch['score_ids'].shape[-1] for batch in batch_lst)
+                
+                # 对每个批次的 score_ids 进行填充
+                for i, batch in enumerate(batch_lst):
+                    score_ids = batch['score_ids']
+                    current_len = score_ids.shape[-1]
+                    if current_len < max_score_len:
+                        pad_size = max_score_len - current_len
+                        padded_score_ids = torch.nn.functional.pad(score_ids, (0, pad_size), value=-1)
+                        # 创建新的 TensorDict，替换 score_ids
+                        new_tensors = {k: v for k, v in batch.items()}
+                        new_tensors['score_ids'] = padded_score_ids
+                        batch_lst[i] = TensorDict(new_tensors, batch_size=batch.batch_size)
+            
+            new_batch = torch.cat(batch_lst, dim=0) if batch_lst[0] is not None else None
+        else:
+            new_batch = None
+        #########################################
+
 
         non_tensor_batch = list_of_dict_to_dict_of_list(list_of_dict=[d.non_tensor_batch for d in data])
         for key, val in non_tensor_batch.items():

@@ -164,7 +164,6 @@ def compute_grpo_outcome_advantage(
 
     return scores, scores
 
-
 def compute_grpo_prm_advantage(
     token_level_rewards: torch.Tensor,
     response_mask: torch.Tensor,
@@ -175,17 +174,22 @@ def compute_grpo_prm_advantage(
     norm_adv_by_std_in_grpo: str = True,
 ):
     """
-    Compute advantage for GRPO, operating only on Outcome reward
-    (with only one scalar reward for each response).
+    Compute advantage for GRPO with Process Reward Model (PRM).
     Args:
         token_level_rewards: `(torch.Tensor)`
             shape: (bs, response_length)
         response_mask: `(torch.Tensor)`
             shape: (bs, response_length)
+        index: `(np.ndarray)`
+            prompt indices for grouping rollouts
+        score_idx: `(torch.Tensor)`
+            indices of step ending tokens, padded with -1
+            shape: (bs, max_steps)
+        reward_mask: `(torch.Tensor)`
+            mask for valid steps (1 for valid, 0 for padding)
+            shape: (bs, max_steps)
         norm_adv_by_std_in_grpo: (bool)
             whether to scale the GRPO advantage.
-            If True, the advantage is scaled by the std, as in the original GRPO.
-            If False, the advantage is not scaled, as in Dr.GRPO (https://arxiv.org/abs/2503.20783).
 
     Returns:
         advantages: `(torch.Tensor)`
@@ -193,40 +197,70 @@ def compute_grpo_prm_advantage(
         Returns: `(torch.Tensor)`
             shape: (bs, response_length)
     """
-    scores = token_level_rewards.sum(dim=-1)
-    print(f"Reward shape:{token_level_rewards.shape}")
-    print("The shape of score_idx:", score_idx.shape)
-    print("The shape of reward_mask:", reward_mask.shape)
-    print("The example of score_idx:", score_idx[0])
-    print("The example of reward_mask:", reward_mask[0])
-    import pdb;pdb.set_trace()
-
-    id2score = defaultdict(list)
-    id2mean = {}
-    id2std = {}
-
-    import pdb;pdb.set_trace()
+    bsz, response_length = token_level_rewards.shape
+    max_steps = score_idx.shape[1]
+    
+    # Initialize token-level advantages as zeros
+    token_advantages = torch.zeros_like(token_level_rewards)
+    
     with torch.no_grad():
-        bsz = scores.shape[0]
-        for i in range(bsz):
-            id2score[index[i]].append(scores[i])
-        for idx in id2score:
-            if len(id2score[idx]) == 1:
-                id2mean[idx] = torch.tensor(0.0)
-                id2std[idx] = torch.tensor(1.0)
-            elif len(id2score[idx]) > 1:
-                id2mean[idx] = torch.mean(torch.tensor(id2score[idx]))
-                id2std[idx] = torch.std(torch.tensor([id2score[idx]]))
-            else:
-                raise ValueError(f"no score in prompt index: {idx}")
-        for i in range(bsz):
-            if norm_adv_by_std_in_grpo:
-                scores[i] = (scores[i] - id2mean[index[i]]) / (id2std[index[i]] + epsilon)
-            else:
-                scores[i] = scores[i] - id2mean[index[i]]
-        scores = scores.unsqueeze(-1) * response_mask
+        # Process each step position
+        for step in range(max_steps):
+            # Collect step rewards for current step across all samples
+            step_rewards = []
+            valid_samples = []
+            
+            for i in range(bsz):
+                if reward_mask[i, step] > 0 and score_idx[i, step] >= 0:
+                    step_pos = score_idx[i, step]
+                    step_reward = token_level_rewards[i, step_pos]
+                    step_rewards.append(step_reward)
+                    valid_samples.append(i)
+            
+            if len(step_rewards) == 0:
+                continue
+                
+            step_rewards = torch.stack(step_rewards)
+            
+            # Group by prompt index for current step
+            id2score = defaultdict(list)
+            id2mean = {}
+            id2std = {}
+            
+            for idx, sample_i in enumerate(valid_samples):
+                prompt_idx = index[sample_i]
+                id2score[prompt_idx].append(step_rewards[idx])
+            
+            # Compute mean and std for each prompt group
+            for prompt_idx in id2score:
+                if len(id2score[prompt_idx]) == 1:
+                    id2mean[prompt_idx] = torch.tensor(0.0)
+                    id2std[prompt_idx] = torch.tensor(1.0)
+                elif len(id2score[prompt_idx]) > 1:
+                    id2mean[prompt_idx] = torch.mean(torch.stack(id2score[prompt_idx]))
+                    id2std[prompt_idx] = torch.std(torch.stack(id2score[prompt_idx]))
+                else:
+                    raise ValueError(f"no score in prompt index: {prompt_idx}")
+            
+            # Compute step-level advantages and assign to specific token positions
+            for idx, sample_i in enumerate(valid_samples):
+                prompt_idx = index[sample_i]
+                step_pos = score_idx[sample_i, step]
+                
+                if norm_adv_by_std_in_grpo:
+                    step_advantage = (step_rewards[idx] - id2mean[prompt_idx]) / (id2std[prompt_idx] + epsilon)
+                else:
+                    step_advantage = step_rewards[idx] - id2mean[prompt_idx]
+                
+                # Only assign advantage to the specific step ending token
+                token_advantages[sample_i, step_pos] = step_advantage
+        
+        # Apply response mask
+        token_advantages = token_advantages * response_mask
 
-    return scores, scores
+    return token_advantages, token_advantages
+
+
 
 
 def compute_reinforce_plus_plus_baseline_outcome_advantage(token_level_rewards: torch.Tensor, response_mask: torch.Tensor, index: torch.Tensor, epsilon: float = 1e-6):
