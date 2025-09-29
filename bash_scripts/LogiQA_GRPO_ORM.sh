@@ -42,10 +42,10 @@ python3 -m verl.trainer.main_ppo \
     trainer.critic_warmup=0 \
     trainer.logger=['console','wandb'] \
     trainer.project_name='verl' \
-    trainer.experiment_name='Qwen2.5-1.5B_GRPO_LogiQA_ORM_eps1' \
+    trainer.experiment_name='Qwen2.5-1.5B_GRPO_LogiQA_ORM_eps3' \
     trainer.n_gpus_per_node=2 \
     trainer.nnodes=1 \
     trainer.save_freq=-1 \
     trainer.test_freq=10 \
-    trainer.total_epochs=1 $@
+    trainer.total_epochs=3 $@
 

@@ -995,24 +995,28 @@ class RayPPOTrainer:
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
 
                     with _timer("reward", timing_raw):
+                        # [info] 对每一步使用 Outcome Reward 加权使用
+                        reward_dict = self.reward_fn(batch, return_dict=True)
+                        batch.union(DataProto.from_dict({"outcome_reward":reward_dict["reward_tensor"]}))
+
                         # compute reward model score
                         if self.use_rm:
                             import time
                             start = time.perf_counter()
 
-                            reward_tensor = self.rm_wg.compute_rm_score(batch)
+                            reward_tensor = self.rm_wg.compute_rm_score(batch)# Process Reward
                             batch = batch.union(reward_tensor)
 
                             end = time.perf_counter()
-                            print(f"[Info] Compute PRM cost {end - start} seconds, per sample cost {(end-start)/len(batch)}, {len(batch)} samples")
+                            print(f"[Info] Compute PRM cost {end - start} seconds, per sample cost {(end-start)/len(batch)}, {len(batch)} samples in total!!")
                         
                         # if self.config.reward_model.launch_reward_fn_async:
                         #     future_reward = compute_reward_async.remote(batch, self.config, self.tokenizer)
                         # else:
-                        reward_dict = self.reward_fn(batch, return_dict=True)
+                        # reward_dict = self.reward_fn(batch, return_dict=True)#[info]上面如果不先计算 ORM，解除注释这一行
                         
                         # PRM: function reward
-                        reward_fn_tensor = reward_dict["reward_tensor"]
+                        reward_fn_tensor = reward_dict["reward_tensor"]# Outcome Reward
                         if not self.use_rm:
                             reward_tensor = reward_fn_tensor
                         reward_fn_dict = DataProto.from_dict({
@@ -1074,10 +1078,15 @@ class RayPPOTrainer:
                         token_level_vr = batch.batch['reward_fn_scores']
 
                         if 'rm_scores' in batch.batch.keys():
+                            # [info] 如果不是单步用 Outcome Reward 加权，请取消注释
+                            '''
                             vr_coef = self.config.reward_model.get('verifiable_reward_coef', 1.0)
                             rm_coef = self.config.reward_model.get('modeling_reward_coef', 1.0)
                             rm_scores = batch.batch['rm_scores']
                             token_level_scores = token_level_vr * vr_coef + rm_scores * rm_coef
+                            '''
+                            rm_scores = batch.batch['rm_scores']
+                            token_level_scores = rm_scores
                         else:
                             token_level_scores = token_level_vr
                         batch.batch['token_level_scores'] = token_level_scores

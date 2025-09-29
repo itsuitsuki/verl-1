@@ -1,9 +1,9 @@
-MODEL_PATH=/share/nlp/chenzhenbin/Workspaces/LLMs/Qwen2.5-14B-Instruct
+MODEL_PATH=/share/nlp/chenzhenbin/Workspaces/LLMs/Qwen2.5-7B-Instruct
 VLLM_HOST=0.0.0.0
-VLLM_PORT=8000
+VLLM_PORT=1029
 GPU_MEMORY_UTIL=0.3
 MAX_MODEL_LEN=2048
-TENSOR_PARALLEL_SIZE=4
+TENSOR_PARALLEL_SIZE=2
 
 print_info() {
     echo -e "${GREEN}[INFO]${NC} $1"

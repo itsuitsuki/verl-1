@@ -9,10 +9,10 @@ PRM_PATH=/share/nlp/chenzhenbin/Workspaces/LLMs/PURE-PRM-7B
 
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=step_grpo \
-    data.train_files=$HOME/data/logiqa/train.parquet \
-    data.val_files=$HOME/data/logiqa/test.parquet \
+    data.train_files=$HOME/data/logiqa_outline/train.parquet \
+    data.val_files=$HOME/data/logiqa_outline/test.parquet \
     data.train_batch_size=16 \
-    data.max_prompt_length=512 \
+    data.max_prompt_length=2048 \
     data.max_response_length=2048 \
     data.filter_overlong_prompts=True \
     data.truncation='error' \
@@ -46,7 +46,7 @@ python3 -m verl.trainer.main_ppo \
     trainer.val_before_train=False \
     trainer.logger=['console','wandb'] \
     trainer.project_name='verl' \
-    trainer.experiment_name='Qwen2.5-1.5B_GRPO_LogiQA_PRM_eps3' \
+    trainer.experiment_name='Qwen2.5-1.5B_GRPO_LogiQA_PRM_eps3_outline' \
     trainer.n_gpus_per_node=2 \
     trainer.nnodes=1 \
     trainer.save_freq=-1 \
