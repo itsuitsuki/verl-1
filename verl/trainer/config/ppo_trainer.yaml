@@ -235,6 +235,11 @@ trainer:
   log_val_generations: 0
   rollout_data_dir: null # directory for logging the rollout data, no dump if null
   validation_data_dir: null # directory for logging the validation data, no dump if null
+  tree_sampling: false   # enable entropy-guided tree sampling
+  branch_level: step    # step: previous implementation; token: per-token node expansion
+  step_reward_type: random  # random | fol | format
+  tree_rounds: 1        # number of tree expansion rounds
+  tree_top_k: 1         # branches per sample when branch_level=step (token mode always picks top-1)
   nnodes: 1
   n_gpus_per_node: 8
   save_freq: -1

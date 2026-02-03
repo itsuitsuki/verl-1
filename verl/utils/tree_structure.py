@@ -11,9 +11,11 @@ from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import hashlib
-import torch
 import random
+import re
+
 import numpy as np
+import torch
 
 from verl.utils.reward_score.logi import compute_score
 
@@ -137,10 +139,21 @@ def _pad_and_stack(seqs: Sequence[torch.Tensor], pad_token_id: int, device: torc
 class TreeManager:
     """Manage search trees for multiple prompts and build branch inputs."""
 
-    def __init__(self, tokenizer=None, pad_token_id: int | None = None, default_reward: float = 1.0):
+    def __init__(
+        self,
+        tokenizer=None,
+        pad_token_id: int | None = None,
+        default_reward: float = 1.0,
+        branch_level: str = "step",
+        step_reward_type: str = "random",
+    ):
         self.tokenizer = tokenizer
         self.pad_token_id = pad_token_id if pad_token_id is not None else (tokenizer.pad_token_id if tokenizer is not None else 0)
         self.default_reward = default_reward
+        self.branch_level = branch_level if branch_level in {"step", "token"} else "step"
+        self.step_reward_type = (step_reward_type or "random").lower()
+        if self.step_reward_type not in {"random", "fol", "format"}:
+            self.step_reward_type = "random"
         self.trees: Dict[str, SearchTree] = {}
         # a stub scorer that can be overridden later
         self.step_scorer = self._random_step_scorer
@@ -160,6 +173,42 @@ class TreeManager:
         summaries = [f"prompt_id={pid}, nodes={self._count_nodes(tree.root)}" for pid, tree in self.trees.items()]
         inner = "; ".join(summaries) if summaries else "empty"
         return f"TreeManager({inner})"
+
+    # -------------------------------
+    # step reward helpers
+
+    def _compute_step_reward(self, step_text: str, prompt_text: Optional[str], step_content: List[str]) -> float:
+        """根据 step_reward_type 计算 step 级奖励。
+
+        - random: 默认随机 0/1（与 naive manager 对齐）
+        - fol: 使用 nl2fol 翻译与执行（需要 prompt 中有 <Context>/<Question>/<Options>）
+        - format: 轻量格式检查，占位实现（非空给 1.0，否则 0.0），后续可替换更严格规则
+        """
+
+        if self.step_reward_type == "fol":
+            try:
+                from verl.utils.nl2fol import fol_prepocessing, translate_and_execute_fol
+
+                if prompt_text:
+                    context_match = re.search(r"<Context>(.*?)</Context>", prompt_text, re.DOTALL)
+                    context = context_match.group(1).strip() if context_match else None
+                    question_match = re.search(r"<Question>(.*?)</Question>", prompt_text, re.DOTALL)
+                    question = question_match.group(1).strip() if question_match else None
+                    options_match = re.search(r"<Options>(.*?)</Options>", prompt_text, re.DOTALL)
+                    options = options_match.group(1).strip() if options_match else None
+                    declaration = fol_prepocessing(context, question, options)
+                    sentences = "\n\n".join(step_content)
+                    return float(translate_and_execute_fol(declaration=declaration, sentences=sentences))
+            except Exception:
+                # FOL 失败回退到随机
+                return self._random_step_scorer(step_text)
+
+        if self.step_reward_type == "format":
+            # 占位的格式奖励：非空文本记 1，空文本记 0；可后续替换为严格规则
+            return 1.0 if step_text and step_text.strip() else 0.0
+
+        # 默认 random（含异常回退）
+        return self._random_step_scorer(step_text)
 
     def _get_prompt_id(self, prompt_tensor: torch.Tensor) -> str:
         # Stable, content-based id: md5 over tensor bytes
@@ -248,8 +297,15 @@ class TreeManager:
             prompt_idx = i % prompt_batch_size
             prompt_tensor = prompts_source[prompt_idx]
             response_tensor = responses[i]
-            # Decode response and split into steps by blank line
-            if self.tokenizer is None:
+            # Decode response and split into steps
+            if self.branch_level == "token":
+                # Each token is treated as an individual step
+                step_token_spans = [(pos, pos + 1) for pos in range(response_tensor.size(0))]
+                if self.tokenizer is not None:
+                    segments = [self.tokenizer.decode(response_tensor[pos : pos + 1], skip_special_tokens=True) for pos in range(response_tensor.size(0))]
+                else:
+                    segments = [""] * response_tensor.size(0)
+            elif self.tokenizer is None:
                 # Without tokenizer, fall back to whole response as one step
                 segments = [""]
                 step_token_spans = [(0, response_tensor.size(0))]
@@ -278,16 +334,7 @@ class TreeManager:
             # Build chain of nodes: root -> step1 -> step2 ...
             prompt_text = None
             if self.tokenizer is not None:
-                import re
-                from verl.utils.nl2fol import fol_prepocessing
                 prompt_text = self.tokenizer.decode(prompt_tensor, skip_special_tokens=True)
-                context_match = re.search(r"<Context>(.*?)</Context>", prompt_text, re.DOTALL)
-                context = context_match.group(1).strip() if context_match else None
-                question_match = re.search(r"<Question>(.*?)</Question>", prompt_text, re.DOTALL)
-                question = question_match.group(1).strip() if question_match else None
-                options_match = re.search(r"<Options>(.*?)</Options>", prompt_text, re.DOTALL)
-                options = options_match.group(1).strip() if options_match else None
-                declaration = fol_prepocessing(context, question, options)
             prompt_id = self._get_prompt_id(prompt_tensor)
             ground_truth = self.prompt_ground_truth.get(prompt_id)
             tree = self.ensure_tree(prompt_tensor, prompt_text=prompt_text, ground_truth=ground_truth)
@@ -297,16 +344,11 @@ class TreeManager:
             step_rewards: list[float] = []
             step_content: list[str] = []
             for (s, e), seg_text, seg_ent in zip(step_token_spans, segments, step_entropies):
-                # use stub scorer to assign reward (random 0/1 by default)
                 step_content.append(seg_text)
-                sentences = "\n\n".join(step_content)
-                from verl.utils.nl2fol import translate_and_execute_fol
-                fol_reward = translate_and_execute_fol(declaration=declaration, sentences=sentences)
-                import pdb;pdb.set_trace()
-                # seg_reward = self.step_scorer(seg_text)
-                seg_reward = fol_reward
-                if seg_reward == 1:
-                    step_content.append(seg_text)
+                if self.branch_level == "token":
+                    seg_reward = 0.0
+                else:
+                    seg_reward = self._compute_step_reward(seg_text=seg_text, prompt_text=prompt_text, step_content=step_content)
                 node = tree.add_step(step_idx=e - 1 if e > 0 else -1, entropy=seg_ent, reward=seg_reward, text=seg_text, parent=parent)
                 parent = node
                 node_chain.append(node)
@@ -328,7 +370,7 @@ class TreeManager:
             )
 
             # select top-k steps by entropy (per sample)
-            k = max(1, top_k)
+            k = 1 if self.branch_level == "token" else max(1, top_k)
             sorted_idx = sorted(range(len(step_entropies)), key=lambda x: step_entropies[x], reverse=True)
             for idx in sorted_idx[:k]:
                 span_start, span_end = step_token_spans[idx]
@@ -385,9 +427,18 @@ class TreeManager:
             if self.tokenizer is not None:
                 resp_text = self.tokenizer.decode(response, skip_special_tokens=True)
                 segments = resp_text.split("\n\n") if resp_text else [""]
+                prompt_text = self.tokenizer.decode(prompt_source[idx], skip_special_tokens=True) if prompt_source is not None else None
             else:
+                prompt_text = None
                 segments = [""]
-            step_rewards = [self.step_scorer(seg) for seg in segments]
+            step_content: list[str] = []
+            step_rewards: list[float] = []
+            for seg in segments:
+                step_content.append(seg)
+                if self.branch_level == "token":
+                    step_rewards.append(0.0)
+                else:
+                    step_rewards.append(self._compute_step_reward(seg, prompt_text, step_content))
 
             # compute spans for branch response
             step_spans = []

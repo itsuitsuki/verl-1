@@ -337,8 +337,16 @@ class RayPPOTrainer:
         self.use_rm = Role.RewardModel in role_worker_mapping
         self.ray_worker_group_cls = ray_worker_group_cls
         self.validation_generations_logger = ValidationGenerationsLogger()
+        self.tree_sampling = bool(config.trainer.get("tree_sampling", True))
+        self.branch_level = config.trainer.get("branch_level", "step")
+        self.step_reward_type = config.trainer.get("step_reward_type", "random")
 
-        self.tree_manager = TreeManager(tokenizer=self.tokenizer, pad_token_id=getattr(self.tokenizer, "pad_token_id", 0))
+        self.tree_manager = TreeManager(
+            tokenizer=self.tokenizer,
+            pad_token_id=getattr(self.tokenizer, "pad_token_id", 0),
+            branch_level=self.branch_level,
+            step_reward_type=self.step_reward_type,
+        )
 
         self.record_table = None
 
@@ -922,7 +930,7 @@ class RayPPOTrainer:
         )
         self.logger = logger
 
-        # # 记录模型的回答和奖励情况
+        # 记录模型的回答和奖励情况
         if 'wandb' in self.config.trainer.logger:
             self.record_table = logger.build_wandb_table(columns=["epoch","global_step","prompt","response","ground_truth","outcome_reward"])
             self.validation_table = logger.build_wandb_table(columns=["epoch","global_step","prompt","response","ground_truth","outcome_reward"])
@@ -955,7 +963,6 @@ class RayPPOTrainer:
         for epoch in range(self.config.trainer.total_epochs):
 
             for batch_dict in self.train_dataloader:
-                # Todo: 为了每一个 prompt 初始化一颗搜索树（因此，需要写一个tree_structure.py 文件放在 utils 文件夹，里面包含这个树的类）。其中，树里面的每个结点是 response 的一个步骤。（在 tree_structure.py中我们还需要定义一个 Node 类，这个类要记录是否是叶子、步骤的平均熵是多少等）tree_structure.py 的 实现请参考普通的 MCTS过程，可能它还要包含一个根据叶子结点的评分进行回传的功能。
                 metrics = {}
                 timing_raw = {}
                 reward_extra_infos_dict = {}
@@ -976,7 +983,9 @@ class RayPPOTrainer:
                 )
 
                 # Initialize a search tree for each prompt in the current batch
-                self.tree_manager.register_batch(gen_batch)
+                if self.tree_sampling:
+                    self.tree_manager.branch_level = self.branch_level
+                    self.tree_manager.register_batch(gen_batch)
 
 
                 is_last_step = self.global_steps >= self.total_training_steps
@@ -991,30 +1000,31 @@ class RayPPOTrainer:
                             gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch)
                             self.async_rollout_manager.sleep()
 
-                    # 多轮 Top-K 扩展：每轮挑选最高熵的 k 个步骤进行扩展
-                    tree_rounds = self.config.trainer.get("tree_rounds", 1)
-                    tree_top_k = self.config.trainer.get("tree_top_k", 1)
-                    for _ in range(max(1, tree_rounds)):
-                        branch_plan = self.tree_manager.prepare_branches(
-                            gen_batch=gen_batch,
-                            gen_batch_output=gen_batch_output,
-                            compute_log_prob_fn=self.actor_rollout_wg.compute_log_prob,
-                            top_k=tree_top_k,
-                        )
+                    if self.tree_sampling:
+                        # 多轮 Top-K 扩展：每轮挑选最高熵的 k 个步骤进行扩展
+                        tree_rounds = self.config.trainer.get("tree_rounds", 1)
+                        tree_top_k = self.config.trainer.get("tree_top_k", 1)
+                        for _ in range(max(1, tree_rounds)):
+                            branch_plan = self.tree_manager.prepare_branches(
+                                gen_batch=gen_batch,
+                                gen_batch_output=gen_batch_output,
+                                compute_log_prob_fn=self.actor_rollout_wg.compute_log_prob,
+                                top_k=tree_top_k,
+                            )
 
-                        if branch_plan is not None and branch_plan.branch_batch is not None and branch_plan.batch_size > 0:
-                            with _timer("gen_branch", timing_raw):
-                                branch_gen_output = self.actor_rollout_wg.generate_sequences(branch_plan.branch_batch)
-                            self.tree_manager.commit_branch_outputs(branch_gen_output, branch_plan)
+                            if branch_plan is not None and branch_plan.branch_batch is not None and branch_plan.batch_size > 0:
+                                with _timer("gen_branch", timing_raw):
+                                    branch_gen_output = self.actor_rollout_wg.generate_sequences(branch_plan.branch_batch)
+                                self.tree_manager.commit_branch_outputs(branch_gen_output, branch_plan)
 
-                    # 将树中所有路径整理成 DataProto，作为训练使用的响应集合
-                    # 在整理前，对每棵树做一次 MCTS 式的正确性回传，得到状态价值
-                    self.tree_manager.backpropagate_correctness()
-                    # 计算每个步骤的折扣回报（Q 值）
-                    self.tree_manager.compute_q_values(gamma=self.config.algorithm.get("gamma", 0.99))
-                    tree_batch_output = self.tree_manager.build_response_batch()
-                    if tree_batch_output is not None:
-                        gen_batch_output = tree_batch_output
+                        # 将树中所有路径整理成 DataProto，作为训练使用的响应集合
+                        # 在整理前，对每棵树做一次 MCTS 式的正确性回传，得到状态价值
+                        self.tree_manager.backpropagate_correctness()
+                        # 计算每个步骤的折扣回报（Q 值）
+                        self.tree_manager.compute_q_values(gamma=self.config.algorithm.get("gamma", 0.99))
+                        tree_batch_output = self.tree_manager.build_response_batch()
+                        if tree_batch_output is not None:
+                            gen_batch_output = tree_batch_output
                     # --------------------------------------------------------------------------- #
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                         with _timer("gen_max", timing_raw):
