@@ -14,9 +14,11 @@
 
 ### Prerequisites
 
-- Python >= 3.11.0
-- PyTorch >= 2.0.0
+- Python >= 3.11.0 （3.10 may raise some bug in deepseed)
+- PyTorch >= 2.0.0 (2.6.0 is Recommended)
 - CUDA >= 12.4
+- ray==2.48.0
+- vllm==0.8.5.post1
 
 ### Environment Setup
 
@@ -57,6 +59,12 @@ python3 examples/data_preprocess/gsm8k.py --local_dir data/gsm8k
 ```
 python3 examples/data_preprocess/logiqa.py --local_dir data/logiqa
 ```
+### LogiQA for Tree Sampling
+```
+python3 examples/data_preprocess/logiqa_tree.py --local_dir data/logiqa_tree
+```
+
+
 
 ## Usage
 
@@ -71,8 +79,8 @@ sh bash_scripts/*.sh
 
 ## Evaluation
 ### Method 1:
-一般使用我自己的评估脚本 [LogiEval](https://github.com/BiNLP/LogiEval)
-### Method 2:
+[LogiEval](https://github.com/BiNLP/LogiEval)
+### Method 2 (Recommended):
 使用 lighteval：
 ```
 sh bash_scripts/eval.sh
@@ -98,4 +106,8 @@ reward_model.worker_type = 'judge'
 ```
 reward_model.worker_type = 'async_judge'
 ```
+
+### Step-level TreeRL
+The startup script is located at ```bash_script/Step```
+
 

@@ -93,6 +93,7 @@ class AdvantageEstimator(str, Enum):
     RLOO = "rloo"
     STEP_GRPO = "step_grpo"
     Tree_GRPO = "tree_grpo"
+    Tree_GAE = "tree_gae"
 
 
 @dataclass
@@ -281,10 +282,65 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
         )
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
+
+    elif adv_estimator == AdvantageEstimator.Tree_GAE:
+        values = organize_values_from_q_values(data.batch)
+        advantages, returns = core_algos.compute_gae_advantage_return(
+            token_level_rewards=data.batch["token_level_rewards"],
+            values=values,
+            response_mask=data.batch["response_mask"],
+            gamma=gamma,
+            lam=lam,
+        )
+        data.batch["values"] = values
+        data.batch["advantages"] = advantages
+        data.batch["returns"] = returns
     else:
         raise NotImplementedError
     return data
 
+def organize_values_from_q_values(batch):
+    """Expand per-step Q values to token-level values, aligned with rewards.
+
+    Priority:
+    1) Use prebuilt token-level Q scores (step_q_scores) from TreeManager if present.
+    2) Fallback to state_value_scores (averaged correctness) if available.
+    3) Fallback to token_level_rewards as a safe default (no critic).
+
+    The returned tensor matches token_level_rewards in shape so it can be
+    consumed by compute_gae_advantage_return.
+    """
+
+    token_level_rewards = batch.get("token_level_rewards")
+    if token_level_rewards is None:
+        raise ValueError("token_level_rewards missing in batch; cannot align values")
+
+    values = batch.get("step_q_scores")
+    if values is None:
+        values = batch.get("state_value_scores")
+    if values is None:
+        values = token_level_rewards
+
+    # Align shape with rewards (B, T)
+    if values.shape != token_level_rewards.shape:
+        b, t = token_level_rewards.shape
+        vb, vt = values.shape
+        if vb != b:
+            # broadcast or trim batch dimension if mismatched
+            if vb == 1:
+                values = values.expand(b, -1)
+            else:
+                values = values[:b]
+                vb = b
+        if vt < t:
+            pad = torch.zeros((vb, t), device=values.device, dtype=values.dtype)
+            pad[:, :vt] = values
+            values = pad
+        elif vt > t:
+            values = values[:, :t]
+
+    batch["values"] = values
+    return values
 
 @contextmanager
 def _timer(name: str, timing_raw: Dict[str, float]):
@@ -365,6 +421,7 @@ class RayPPOTrainer:
             AdvantageEstimator.REINFORCE_PLUS_PLUS_BASELINE,
             AdvantageEstimator.STEP_GRPO,
             AdvantageEstimator.Tree_GRPO,
+            AdvantageEstimator.Tree_GAE,
         ]:
             self.use_critic = False
         else:
@@ -379,7 +436,8 @@ class RayPPOTrainer:
         n_gpus = config.trainer.n_gpus_per_node * config.trainer.nnodes
 
         # 1. Check total batch size for data correctness
-        real_train_batch_size = config.data.train_batch_size * config.actor_rollout_ref.rollout.n
+        # real_train_batch_size = config.data.train_batch_size * config.actor_rollout_ref.rollout.n
+        real_train_batch_size = config.data.train_batch_size * config.actor_rollout_ref.rollout.n * (config.trainer.tree_rounds+1) * config.trainer.tree_top_k # consider tree sampling
         assert real_train_batch_size % n_gpus == 0, f"real_train_batch_size ({real_train_batch_size}) must be divisible by total n_gpus ({n_gpus})."
 
         # A helper function to check "micro_batch_size" vs "micro_batch_size_per_gpu"
@@ -1022,6 +1080,8 @@ class RayPPOTrainer:
                         self.tree_manager.backpropagate_correctness()
                         # 计算每个步骤的折扣回报（Q 值）
                         self.tree_manager.compute_q_values(gamma=self.config.algorithm.get("gamma", 0.99))
+                        # TreeRL: 根据节点 Q 值差分计算奖励
+                        self.tree_manager.apply_treerl_rewards()
                         tree_batch_output = self.tree_manager.build_response_batch()
                         if tree_batch_output is not None:
                             gen_batch_output = tree_batch_output

@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import hashlib
+import math
 import random
 import re
 
@@ -152,7 +153,7 @@ class TreeManager:
         self.default_reward = default_reward
         self.branch_level = branch_level if branch_level in {"step", "token"} else "step"
         self.step_reward_type = (step_reward_type or "random").lower()
-        if self.step_reward_type not in {"random", "fol", "format"}:
+        if self.step_reward_type not in {"random", "fol", "format", "treerl"}:
             self.step_reward_type = "random"
         self.trees: Dict[str, SearchTree] = {}
         # a stub scorer that can be overridden later
@@ -202,13 +203,21 @@ class TreeManager:
             except Exception:
                 # FOL 失败回退到随机
                 return self._random_step_scorer(step_text)
-
-        if self.step_reward_type == "format":
-            # 占位的格式奖励：非空文本记 1，空文本记 0；可后续替换为严格规则
-            return 1.0 if step_text and step_text.strip() else 0.0
-
-        # 默认 random（含异常回退）
-        return self._random_step_scorer(step_text)
+        elif self.step_reward_type == "format":
+            # 检查 step 文本是否符合格式：是否被 <Action></Action> 包围
+            return 1.0 if re.match(r"<Action>(.*?)</Action>", step_text, re.DOTALL) else 0.0
+        elif self.step_reward_type == "treerl":
+            """
+            TreeRL 的奖励需要在采样结束、每个结点的 Q value 都被计算出来后才能确定，它的计算方法如下：
+            1. Gobal Reward = V(s_n) - V(root): 也就是当前结点的 Q value 减去 根结点的 Q value 的值；
+            2. Local Reward = V(s_n) - V(parent(s_n)): 也就是当前结点的 Q value 减去 父结点的 Q value 的值；
+            3. 最终的 Reward = (Global Reward + Local Reward) / sqrt(s_n 的叶子节点个数)
+            所以这里暂时返回默认奖励。
+            """
+            return float(self.default_reward) if self.default_reward is not None else 0.0
+        else:
+            # 默认 random（含异常回退）
+            return self._random_step_scorer(step_text)
 
     def _get_prompt_id(self, prompt_tensor: torch.Tensor) -> str:
         # Stable, content-based id: md5 over tensor bytes
@@ -348,7 +357,7 @@ class TreeManager:
                 if self.branch_level == "token":
                     seg_reward = 0.0
                 else:
-                    seg_reward = self._compute_step_reward(seg_text=seg_text, prompt_text=prompt_text, step_content=step_content)
+                    seg_reward = self._compute_step_reward(step_text=seg_text, prompt_text=prompt_text, step_content=step_content)
                 node = tree.add_step(step_idx=e - 1 if e > 0 else -1, entropy=seg_ent, reward=seg_reward, text=seg_text, parent=parent)
                 parent = node
                 node_chain.append(node)
@@ -551,6 +560,54 @@ class TreeManager:
             elif record.leaf_node is not None and q_vals:
                 record.leaf_node.q_value = q_vals[0]
 
+    # ------------------------------------------------------------------
+    # TreeRL reward computation
+
+    def apply_treerl_rewards(self) -> None:
+        """Compute TreeRL-style rewards after Q values are available.
+
+        Reward(s_n) = ( (V(s_n) - V(root)) + (V(s_n) - V(parent(s_n))) ) / sqrt(#leaves under s_n)
+
+        - V(s) is taken from node.q_value (defaults to 0.0 if missing)
+        - Leaf count guards against malformed trees by enforcing at least 1 leaf
+        - Updates both node.reward and the cached step_rewards inside response_records
+        """
+
+        if self.step_reward_type != "treerl":
+            return
+
+        # Pre-compute leaf counts for every tree
+        leaf_count_cache: Dict[int, int] = {}
+
+        for tree in self.trees.values():
+            counts = self._compute_leaf_counts(tree.root)
+            leaf_count_cache.update(counts)
+
+            # Traverse nodes to assign rewards
+            stack = [tree.root]
+            while stack:
+                node = stack.pop()
+                stack.extend(node.children)
+
+                if node is tree.root:
+                    continue
+
+                leaf_num = max(leaf_count_cache.get(id(node), 1), 1)
+                root_q = float(tree.root.q_value) if tree.root.q_value is not None else 0.0
+                node_q = float(node.q_value) if node.q_value is not None else 0.0
+                parent_q = float(node.parent.q_value) if node.parent is not None and node.parent.q_value is not None else root_q
+
+                global_reward = node_q - root_q
+                local_reward = node_q - parent_q
+                node.reward = (global_reward + local_reward) / math.sqrt(leaf_num)# 更新 reward
+
+        # sync response_records so token-level scores use the new rewards
+        for rec in self.response_records:
+            if rec.nodes:
+                rec.step_rewards = [float(getattr(n, "reward", 0.0) or 0.0) for n in rec.nodes]
+            elif rec.leaf_node is not None:
+                rec.step_rewards = [float(getattr(rec.leaf_node, "reward", 0.0) or 0.0)]
+
     def backpropagate_correctness(self) -> None:
         """Compute outcome correctness for leaves and backpropagate averaged values."""
         if self.tokenizer is None:
@@ -586,6 +643,30 @@ class TreeManager:
 
     def _count_nodes(self, node: Node) -> int:
         return 1 + sum(self._count_nodes(child) for child in node.children)
+
+    def _compute_leaf_counts(self, root: Node) -> Dict[int, int]:
+        """Compute the number of leaf nodes in every subtree (id(node) -> leaf_count).
+
+        Uses an iterative post-order traversal to avoid recursion depth limits.
+        Ensures every non-leaf subtree has at least 1 leaf (guard against malformed trees).
+        """
+
+        postorder: list[Node] = []
+        stack: list[Node] = [root]
+        while stack:
+            n = stack.pop()
+            postorder.append(n)
+            for c in n.children:
+                stack.append(c)
+
+        leaf_counts: Dict[int, int] = {}
+        for n in reversed(postorder):
+            if n.is_leaf:
+                leaf_counts[id(n)] = 1
+            else:
+                count = sum(leaf_counts.get(id(c), 1) for c in n.children)
+                leaf_counts[id(n)] = max(count, 1)
+        return leaf_counts
 
     def _record_response(
         self,
