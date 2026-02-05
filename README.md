@@ -107,7 +107,26 @@ reward_model.worker_type = 'judge'
 reward_model.worker_type = 'async_judge'
 ```
 
-### Step-level TreeRL
-The startup script is located at ```bash_script/Step```
 
+## Tree Sampling for RL Training
+## TreeRL
+
+Please preprocess the dataset before starting.
+
+The startup script is located at ```bash_script/Step_TreeRL_LogiQA_GAE```:
+```
+python3 -m verl.trainer.main_ppo \
+    algorithm.adv_estimator=tree_gae \ # TreeRL 的 Value 并不使用 Critic Model，而是直接用 Backpropagation 之后的结点的 Value 作为 Value
+    ...
+   reward_model.reward_manager='tree' \ # 使用 Tree Sampling 策略，在生成的时候就计算了每个 Step 的 reward 存储在 Node 的结构中，这样方便后面我们提高效率加入 early stop strategy. 所以这里的 Reward Manage 只是负责将 step reward organize 成 reward tensor.
+    trainer.tree_sampling=True \
+    trainer.branch_level='step' \ # 'token' 的话就会每个 token 作为一个结点，对于长的推理序列，树会非常大！！！！
+    trainer.step_reward_type='treerl' \ # 根据论文里面的公式，使用当前结点和 root 结点及其双亲的 Value 来计算 Reward；如果是 'fol'，则会将每一步翻译成 FOL 并使用 Z3 返回结果（Fragile）！！！！
+    trainer.tree_rounds=1 \ # 分支轮数
+    trainer.tree_top_k=1 \ # 每次分支出多少条，目前是只在最高熵的 step 进行分支
+
+```
+**TODO**
+- 1、结点选择问题：反复采样 Top-k 仍然是那 k 个结点的问题；
+- 2、FOL Reward 的脆弱性；
 
