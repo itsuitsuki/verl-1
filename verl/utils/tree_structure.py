@@ -214,6 +214,8 @@ class TreeManager:
         # Store trees in a list indexed by tree_id (0, 1, 2, ...)
         # tree_id corresponds to position in gen_batch_output
         self.trees: List[SearchTree] = []
+        # Snapshot of initial leaves per tree (before any branching)
+        self.initial_leaves: List[List[Node]] = []
         # a stub scorer that can be overridden later
         self.step_scorer = self._random_step_scorer
         # node registries for entropy-based branching
@@ -453,6 +455,7 @@ class TreeManager:
         self.node_map.clear()
         self._node_counter = 0
         self.trees.clear()  # Clear trees list
+        self.initial_leaves.clear()
 
         # ===== Phase 2: Extract data from gen_batch =====
         prompts_source = gen_batch.batch.get("input_ids")
@@ -519,6 +522,8 @@ class TreeManager:
                 ground_truth=ground_truth,
                 index=prompt_idx,  # Track original prompt index
             )
+        # Snapshot initial leaves after first-pass generation (before any branching)
+        self.initial_leaves = [self._get_all_leaves(t.root) for t in self.trees]
 
     def get_top_k_entropy_nodes(self, k: int) -> list[Node]:
         """Select top-k entropy nodes per tree, excluding roots.
@@ -591,7 +596,6 @@ class TreeManager:
         compute_log_prob_fn: Callable[[DataProto], DataProto],
         pad_size: int = 0,
     ) -> None:
-        import pdb; pdb.set_trace()
         # 会生成 rollout.n 个 response，这里我们只取第一个！
         n = len(branch_output) // branch_plan.batch_size
 
@@ -620,8 +624,6 @@ class TreeManager:
                 if t.prompt_id == node.prompt_id:
                     tree = t
                     break  # 找到了！立刻停止循环，不再往后看了
-
-
             if tree is None:
                 raise ValueError(f"No matching tree found for node with prompt_id {node.prompt_id}")
 
@@ -712,9 +714,14 @@ class TreeManager:
         Q_t = r_t + gamma * r_{t+1} + gamma^2 * r_{t+2} + ...
         Traverses each tree and computes Q values along all paths.
         """
-        for tree in self.trees:
+
+        for tree_idx, tree in enumerate(self.trees):
             # For each leaf, traverse path from leaf to root and compute Q values
             leaves = self._get_all_leaves(tree.root)
+            for n in self.initial_leaves[tree_idx]:
+                if n not in leaves:
+                    leaves.append(n)
+
             for leaf in leaves:
                 path = self._get_node_chain(leaf)
                 path.reverse()  # root -> leaf
@@ -895,9 +902,12 @@ class TreeManager:
         response_data_list: list[dict[str, Any]] = []
         
         for tree_idx, tree in enumerate(self.trees):
-            
-            # For each tree (which corresponds to gen_batch_output[tree_idx])
+            # Combine initial snapshot leaves with current leaves, dedup by node_id
             leaves = self._get_all_leaves(tree.root)
+            leaves_initial = self.initial_leaves[tree_idx]
+            for n in leaves_initial:
+                if n not in leaves:
+                    leaves.append(n)
             ground_truth = tree.ground_truth
             print(f"{len(leaves)} leaves found in tree_idx {tree_idx} with ground_truth: {ground_truth}")
             
@@ -905,19 +915,18 @@ class TreeManager:
                 # If no leaves, extract from root
                 print("build_response_batch: No leaves found in tree, extracting from root")
                 response_data = self._reconstruct_path_tensors([tree.root], tree.root)
-            else:
-                # Get all leaf paths
-                for leaf in leaves:
-                    node_chain = self._get_node_chain(leaf)
-                    node_chain.reverse()  # root -> leaf
-                    response_data = self._reconstruct_path_tensors(node_chain, tree.root)
-                    response_data["ground_truth"] = ground_truth
-                    response_data_list.append(response_data)
-                    print(len(response_data_list))
+                response_data["ground_truth"] = ground_truth
+                response_data_list.append(response_data)
                 continue
-            print("build_response_batch: No leaves found, using root path for tree_idx", tree_idx)
-            response_data["ground_truth"] = ground_truth
-            response_data_list.append(response_data)
+
+            # Get all leaf paths (including those from initial snapshot)
+            for leaf in leaves:
+                node_chain = self._get_node_chain(leaf)
+                node_chain.reverse()  # root -> leaf
+                response_data = self._reconstruct_path_tensors(node_chain, tree.root)
+                response_data["ground_truth"] = ground_truth
+                response_data_list.append(response_data)
+                print(len(response_data_list))
 
         
         if not response_data_list:
@@ -1040,7 +1049,7 @@ class TreeManager:
         
         while stack:
             node = stack[-1]
-            node_id = id(node)
+            node_id = node.node_id
             
             if node_id in visited:
                 stack.pop()

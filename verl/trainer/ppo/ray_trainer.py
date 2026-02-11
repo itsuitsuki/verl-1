@@ -1077,7 +1077,12 @@ class RayPPOTrainer:
                                 with _timer("gen_branch", timing_raw):
                                     branch_gen_output = self.actor_rollout_wg.generate_sequences(branch_plan.branch_batch)
                                 self.tree_manager.commit_branch_outputs(branch_gen_output, branch_plan, compute_log_prob_fn=self.actor_rollout_wg.compute_log_prob)
-
+                        
+                        # ------- print tree for debugging ------- #
+                        for i in range(len(self.tree_manager.trees)):
+                            self.tree_manager.pretty_print_tree(i)
+                        # --------------------------------------- #
+                        
                         self.tree_manager.backpropagate_correctness()# MCTS-style correctness backpropagation / TreeRL Node Value
                         self.tree_manager.compute_q_values(gamma=self.config.algorithm.get("gamma", 1))# Return / Q Value Calculation
                         self.tree_manager.apply_treerl_rewards()# TreeRL Reward Calculation
