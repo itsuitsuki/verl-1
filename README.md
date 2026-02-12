@@ -11,7 +11,8 @@
 - [Installation](#installation)
 - [Dataset Preparation](#dataset-preparation)
 - [Evaluation](#evaluation)
-- [Configuration](#configuration)
+- [LLM-as-Judge & PRM](#LLM-as-Judge-&-PRM)
+- [Tree Sampling for RL Training](#Tree-Sampling-for-RL-Training)
 
 # Installation
 
