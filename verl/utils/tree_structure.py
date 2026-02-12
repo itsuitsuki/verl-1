@@ -393,12 +393,9 @@ class TreeManager:
     def _strip_trailing_pad(self, tensor: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
         """Remove trailing pad tokens (by pad_token_id) from a 1D tensor."""
         pad_id = self.pad_token_id
-
-        # TODO: 开头的 pad token 似乎无法移除，后面优化
-        # exclude_ids = torch.tensor([pad_id, 151643]) 
-        # mask = ~torch.isin(tensor, exclude_ids.to(tensor.device)) 
-        # non_pad = mask.nonzero(as_tuple=True)
-        non_pad = (tensor != pad_id).nonzero(as_tuple=True)
+        prompt_text = self.tokenizer.decode(tensor, skip_special_tokens=True) 
+        non_pad = self.tokenizer.encode(prompt_text, add_special_tokens=False, return_tensors="pt")
+        # non_pad = (tensor != pad_id).nonzero(as_tuple=True)
         if len(non_pad) == 0 or non_pad[0].numel() == 0:
             print("[TreeManager._strip_trailing_pad] Warning: tensor is all pad tokens, returning first token to avoid empty tensor!")
             # all pads; keep a single token to avoid empty tensors downstream
@@ -1061,9 +1058,6 @@ class TreeManager:
             print("[INFO]: Add {} leaves! Updated leaves for tree_idx {}: {} leaves total".format(len(leaves), tree_idx, len(self.tree_leaves[tree_idx])))
             for leaf in leaves:
                 print(leaf.node_id)
-            
-
-        self.initial_leaves = [self._get_all_leaves(t.root) for t in self.trees]
     
     def _get_all_leaves(self, root: Node) -> list[Node]:
         """后序遍历获取所有叶子节点。"""

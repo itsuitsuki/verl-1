@@ -311,7 +311,6 @@ def organize_values_from_q_values(batch):
     The returned tensor matches token_level_rewards in shape so it can be
     consumed by compute_gae_advantage_return.
     """
-    import pdb;pdb.set_trace()
     token_level_rewards = batch.get("token_level_rewards")
     if token_level_rewards is None:
         raise ValueError("token_level_rewards missing in batch; cannot align values")
@@ -1080,7 +1079,8 @@ class RayPPOTrainer:
                                 with _timer("gen_branch", timing_raw):
                                     branch_gen_output = self.actor_rollout_wg.generate_sequences(branch_plan.branch_batch)
                                 self.tree_manager.commit_branch_outputs(branch_gen_output, branch_plan, compute_log_prob_fn=self.actor_rollout_wg.compute_log_prob)
-                        
+                                
+
                         # ------- print tree for debugging ------- #
                         for i in range(len(self.tree_manager.trees)):
                             self.tree_manager.pretty_print_tree(i)
@@ -1164,6 +1164,18 @@ class RayPPOTrainer:
                                 verifiable_rewards = reward_fn_tensor.sum(-1)
                                 batch.union(DataProto.from_dict({"verifiable_rewards": verifiable_rewards}))
                             reward_tensor = reward_fn_tensor
+                            reward_dict = self.reward_fn(batch, return_dict=True)
+                            if "outcome_reward" in reward_dict.keys():
+                                metrics.update({"reward/mean_fn_reward": np.mean(reward_dict["outcome_reward"])})
+                                for i in range(len(reward_dict["ground_truth"])):
+                                    self.record_table.add_data(
+                                        epoch,
+                                        self.global_steps,
+                                        str(reward_dict["prompt"][i]),
+                                        str(reward_dict["response"][i]),
+                                        str(reward_dict["ground_truth"][i]),
+                                        str(reward_dict["outcome_reward"][i])
+                                    )
                         else:
                             # if self.config.reward_model.launch_reward_fn_async:
                             #     future_reward = compute_reward_async.remote(batch, self.config, self.tokenizer)
@@ -1292,7 +1304,7 @@ class RayPPOTrainer:
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
                     if rollout_data_dir:
                         with _timer("dump_rollout_generations", timing_raw):
-                            print(batch.batch.keys())
+                            # print(batch.batch.keys())
                             inputs = self.tokenizer.batch_decode(batch.batch["prompts"], skip_special_tokens=True)
                             outputs = self.tokenizer.batch_decode(batch.batch["responses"], skip_special_tokens=True)
                             scores = batch.batch["token_level_scores"].sum(-1).cpu().tolist()
@@ -1322,6 +1334,16 @@ class RayPPOTrainer:
                         "training/epoch": epoch,
                     }
                 )
+
+                                # collect metrics
+                metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
+                metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
+                # TODO: implement actual tflpo and theoretical tflpo
+                n_gpus = self.resource_pool_manager.get_n_gpus()
+                metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
+
+                # TODO: make a canonical logger that supports various backend
+                logger.log(data=metrics, step=self.global_steps)
 
                 if is_last_step:
                     # 补充保存最后的 checkpoint

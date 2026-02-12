@@ -34,11 +34,11 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     algorithm.use_kl_in_reward=True \
     reward_model.enable=false \
-    reward_model.reward_manager='naive_plus' \
+    reward_model.reward_manager='tree' \
     reward_model.model.path=${PRM_PATH} \
     reward_model.micro_batch_size_per_gpu=2 \
     reward_model.model.fsdp_config.optimizer_offload=True \
-    trainer.val_before_train=False \
+    trainer.val_before_train=True \
     trainer.tree_sampling=True \
     trainer.branch_level='step' \
     trainer.step_reward_type='treerl' \

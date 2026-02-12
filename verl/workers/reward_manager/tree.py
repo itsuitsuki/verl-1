@@ -30,12 +30,7 @@ class TreeRewardManager:
         self.reward_fn_key = reward_fn_key
 
     def __call__(self, data: DataProto, return_dict=False):
-        """Compute reward tensor.
-
-        If `step_rewards` is provided per sample (list of floats), it will be broadcast to
-        the corresponding step token spans (split by blank line "\n\n"). Otherwise falls
-        back to the original single-outcome reward logic.
-        """
+        """We will expand this function gradually based on the available datasets"""
         reward_tensor = torch.zeros_like(data.batch["responses"], dtype=torch.float32)
         reward_extra_info = defaultdict(list)
 
@@ -45,12 +40,14 @@ class TreeRewardManager:
         gt = []
         response = []
         outcome_reward = []
-        import pdb;pdb.set_trace()
+
         for i in range(len(data)):
             data_item = data[i]  # DataProtoItem
 
             prompt_ids = data_item.batch["prompts"]
+
             prompt_length = prompt_ids.shape[-1]
+
             valid_prompt_length = data_item.batch["attention_mask"][:prompt_length].sum()
             valid_prompt_ids = prompt_ids[-valid_prompt_length:]
 
@@ -61,54 +58,33 @@ class TreeRewardManager:
             # decode
             prompt_str = self.tokenizer.decode(valid_prompt_ids, skip_special_tokens=True)
             response_str = self.tokenizer.decode(valid_response_ids, skip_special_tokens=True)
-            ground_truth = data_item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None)
-            data_source = data_item.non_tensor_batch.get(self.reward_fn_key, None)
+            ground_truth = data_item.non_tensor_batch["reward_model"]["ground_truth"]
+            data_source = data_item.non_tensor_batch[self.reward_fn_key]
             extra_info = data_item.non_tensor_batch.get("extra_info", None)
 
-            step_rewards = data_item.non_tensor_batch.get("step_rewards")
+            score = self.compute_score(
+                data_source=data_source,
+                solution_str=response_str,
+                ground_truth=ground_truth,
+                extra_info=extra_info,
+            )
 
-            if step_rewards is not None:
-                # use provided step rewards, broadcast to token spans split by blank line
-                segments = response_str.split("\n\n") if response_str else [""]
-                spans = []
-                cursor = 0
-                for seg in segments:
-                    seg_tokens = self.tokenizer.encode(seg, add_special_tokens=False)
-                    start, end = cursor, cursor + len(seg_tokens)
-                    spans.append((start, end))
-                    cursor = end
 
-                for (s, e), r in zip(spans, step_rewards):
-                    start = max(0, s)
-                    end = max(start, min(e, valid_response_length))
-                    if start < end:
-                        reward_tensor[i, start:end] = float(r)
+            outcome_reward.append(score)# 每个 sample的最终reward
+            prompt.append(prompt_str)# 每个sample 的prompt
+            gt.append(ground_truth)# 每个sample 的gt
+            response.append(response_str)# 每个sample 的response
 
-                # outcome reward: sum of step rewards
-                score = sum(step_rewards)
+            if isinstance(score, dict):
+                reward = score["score"]
+                # Store the information including original reward
+                for key, value in score.items():
+                    reward_extra_info[key].append(value)
             else:
-                score = self.compute_score(
-                    data_source=data_source,
-                    solution_str=response_str,
-                    ground_truth=ground_truth,
-                    extra_info=extra_info,
-                )
+                reward = score
 
-                if isinstance(score, dict):
-                    reward = score["score"]
-                    for key, value in score.items():
-                        reward_extra_info[key].append(value)
-                else:
-                    reward = score
-
-                # place outcome reward at last valid token
-                if valid_response_length > 0:
-                    reward_tensor[i, valid_response_length - 1] = reward
-
-            outcome_reward.append(score)
-            prompt.append(prompt_str)
-            gt.append(ground_truth)
-            response.append(response_str)
+            reward_tensor[i, valid_response_length - 1] = reward
+            #reward_tensor[i, :valid_response_length - 1] = reward
 
             if data_source not in already_print_data_sources:
                 already_print_data_sources[data_source] = 0
@@ -131,7 +107,7 @@ class TreeRewardManager:
                 "prompt": prompt,
                 "ground_truth": gt,
                 "response": response,
-                "outcome_reward": outcome_reward,
+                "outcome_reward": outcome_reward
             }
         else:
             return reward_tensor
