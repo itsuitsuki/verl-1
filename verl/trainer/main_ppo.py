@@ -47,6 +47,10 @@ from verl.trainer.ppo.ray_trainer import RayPPOTrainer
 # os.environ["RAY_ADDRESS"] = "127.0.0.1:4869"
 
 
+import sys
+sys.setrecursionlimit(10000)  # increase recursion limit for large models
+
+
 def get_custom_reward_fn(config):
     import importlib.util
     import sys

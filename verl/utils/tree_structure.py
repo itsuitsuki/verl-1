@@ -403,6 +403,31 @@ class TreeManager:
         last_idx = int(non_pad[0][-1].item()) + 1
         return tensor[:last_idx]
 
+    def _evict_oov_token(self, tensor: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+        """Drop tokens that are out-of-vocabulary for the current tokenizer.
+
+        Keeps ordering; filters out ids >= vocab_size. If everything is removed,
+        fallback to returning the original tensor's first token to avoid empty outputs.
+        """
+
+        if tensor is None:
+            return None
+        if self.tokenizer is None:
+            return tensor
+
+        vocab_size = getattr(self.tokenizer, "vocab_size", None)
+        if vocab_size is None:
+            try:
+                vocab_size = len(self.tokenizer.get_vocab())
+            except Exception:
+                return tensor
+
+        mask = tensor < vocab_size
+        if mask.sum() == 0:
+            # all tokens are OOV; keep the first token to avoid empty tensor
+            return tensor[:1]
+        return tensor[mask]
+
     def _reconstruct_prefix_tokens(self, node: Node) -> Optional[torch.Tensor]:
         """Rebuild prompt + response prefix for a node without duplicating spans.
 
@@ -427,9 +452,11 @@ class TreeManager:
 
 
         prompt_clean = self._strip_trailing_pad(prompt_tensor)
+        prompt_clean = self._evict_oov_token(prompt_clean)
         end = max(0, min(target_end, response_tensor.size(0)))
         resp_slice = response_tensor[:end]
         resp_clean = self._strip_trailing_pad(resp_slice)
+        resp_clean = self._evict_oov_token(resp_clean)
 
         return torch.cat([prompt_clean, resp_clean], dim=-1)
 
@@ -1175,8 +1202,6 @@ class TreeManager:
 
     # ------------------------------------------------------------------
     # Helper utilities
-
-
 def _pad_sequences(seqs: Sequence[torch.Tensor], pad_token_id: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Pad a list of 1D token tensors to a batch with attention/position ids."""
     max_len = max(seq.size(0) for seq in seqs)

@@ -2,10 +2,10 @@ set -x
 
 HOME=/home/chenzhb/Workspaces/verl
 
-MODEL_PATH=/home/chenzhb/Workspaces/LLMs/Qwen2.5-1.5B-Instruct
+MODEL_PATH=/home/chenzhb/Workspaces/LLMs/Qwen2.5-7B-Instruct
 
 python3 -m verl.trainer.main_ppo \
-    algorithm.adv_estimator=tree_grpo \
+    algorithm.adv_estimator=grpo \
     data.train_files=$HOME/data/logiqa_tree/train.parquet \
     data.val_files=$HOME/data/logiqa_tree/test.parquet \
     data.train_batch_size=4 \
@@ -28,7 +28,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=4 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=2 \
     actor_rollout_ref.rollout.name=vllm \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.5 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.7 \
     actor_rollout_ref.rollout.n=2 \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=4 \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
@@ -42,10 +42,10 @@ python3 -m verl.trainer.main_ppo \
     trainer.critic_warmup=0 \
     trainer.logger=['console','wandb'] \
     trainer.project_name='verl' \
-    trainer.experiment_name='Qwen2.5-1.5B_GRPO_LogiQA_TREE_eps3' \
+    trainer.experiment_name='Qwen2.5-7B_GRPO_LogiQA_ORM_eps1' \
     trainer.n_gpus_per_node=2 \
     trainer.nnodes=1 \
     trainer.save_freq=-1 \
     trainer.test_freq=10 \
-    trainer.total_epochs=3 $@
+    trainer.total_epochs=1 $@
 
