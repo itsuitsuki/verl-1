@@ -1083,8 +1083,8 @@ class TreeManager:
             leaves = self._get_all_leaves(tree.root)
             self.tree_leaves[tree_idx].update(leaves)
             print("[INFO]: Add {} leaves! Updated leaves for tree_idx {}: {} leaves total".format(len(leaves), tree_idx, len(self.tree_leaves[tree_idx])))
-            for leaf in leaves:
-                print(leaf.node_id)
+            # for leaf in leaves:
+            #     print(leaf.node_id)
     
     def _get_all_leaves(self, root: Node) -> list[Node]:
         """后序遍历获取所有叶子节点。"""
