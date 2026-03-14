@@ -45,7 +45,7 @@ python3 -m verl.trainer.main_ppo \
     trainer.critic_warmup=0 \
     trainer.val_before_train=False \
     trainer.logger=['console','wandb'] \
-    trainer.project_name='verl' \
+    trainer.project_name='verl-fol' \
     trainer.experiment_name='Qwen2.5-1.5B_GRPO_LogiQA_PRM_eps3' \
     trainer.n_gpus_per_node=2 \
     trainer.nnodes=1 \
