@@ -1,13 +1,13 @@
 set -x
 
-HOME=/home/chenzhb/Workspaces/verl
+HOME=~
 
-MODEL_PATH=/home/chenzhb/Workspaces/LLMs/Qwen2.5-1.5B-Instruct
+MODEL_PATH=~/run/models/Qwen2.5-1.5B-Instruct
 
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=tree_gae \
-    data.train_files=$HOME/data/logiqa_tree/train.parquet \
-    data.val_files=$HOME/data/logiqa_tree/test.parquet \
+    data.train_files=./data/logiqa_tree/train.parquet \
+    data.val_files=./data/logiqa_tree/test.parquet \
     data.train_batch_size=2 \
     data.max_prompt_length=512 \
     data.max_response_length=2048 \
@@ -46,8 +46,8 @@ python3 -m verl.trainer.main_ppo \
     trainer.tree_top_k=1 \
     trainer.critic_warmup=0 \
     trainer.logger=['console','wandb'] \
-    trainer.project_name='verl' \
-    trainer.experiment_name='Qwen2.5-1.5B_GRPO_LogiQA_TREE_eps3' \
+    trainer.project_name='verl-fol' \
+    trainer.experiment_name='Qwen2.5-1.5B_TreeRL_LogiQA_GAE_eps3' \
     trainer.n_gpus_per_node=2 \
     trainer.nnodes=1 \
     trainer.save_freq=-1 \
