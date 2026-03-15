@@ -1243,5 +1243,7 @@ def _build_token_level_scores(
             if start >= end:
                 continue
             end = min(end, max_len)
-            scores[i, start:end] = float(r)
+            # scores[i, start:end] = float(r)
+            if end > start:
+                scores[i, start:end] = float(r)
     return scores
