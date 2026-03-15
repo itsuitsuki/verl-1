@@ -581,7 +581,12 @@ class TreeManager:
             # Filter out root and nodes without step info
             candidates = [n for n in nodes if n.parent is not None and n.step_idx != -1 and n.children is not None]
             # Sort by entropy
-            assert candidates!= [], f"No valid nodes found in tree {tree.prompt_id} for entropy selection"
+            
+            # assert candidates!= [], f"No valid nodes found in tree {tree.prompt_id} for entropy selection"
+            # FIXED: remove assert to avoid error when no valid nodes found
+            if not candidates:
+                print(f"[TreeManager.get_top_k_entropy_nodes] Warning: No valid nodes found in tree {tree.prompt_id} for entropy selection")
+                continue
             candidates.sort(key=lambda n: self.node_entropy.get(n.node_id, float("-inf")), reverse=True)
             result.extend(candidates[:k])
 
@@ -602,6 +607,10 @@ class TreeManager:
                 continue
             branch_sequences.append(prefix)
             branch_nodes.append(node)
+
+        # FIXED: add protection to return None when no valid nodes found in the whole batch
+        if not branch_sequences:
+            return None
 
         device = branch_sequences[0].device
         input_ids, attention_mask, position_ids = _pad_and_stack(branch_sequences, pad_token_id=self.pad_token_id, device=device)
